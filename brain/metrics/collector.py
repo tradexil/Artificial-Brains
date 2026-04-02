@@ -40,6 +40,11 @@ class SampleMetrics:
             "sensory_activation", "visual_activation", "audio_activation",
             "motor_activation", "motor_approach", "motor_withdraw", "pain_level",
             "sleep_pressure",
+            "rust_tick_ms", "tick_prepare_ms", "tick_delayed_delivery_ms",
+            "tick_propagate_ms", "tick_update_ms", "evaluation_ms",
+            "evaluation_rust_ms", "snapshot_ms", "batch_state_ms", "trace_match_ms",
+            "learn_step_ms", "formation_ms", "maintain_ms", "other_python_ms",
+            "step_internal_ms",
         ]
         agg: dict[str, Any] = {}
         for key in numeric_keys:
@@ -168,7 +173,12 @@ class MetricsCollector:
                      "emotion_polarity", "emotion_arousal",
                      "language_activation", "speech_activity",
                      "sensory_activation", "visual_activation", "audio_activation",
-                     "motor_activation", "learning_multiplier"):
+                     "motor_activation", "learning_multiplier",
+                     "rust_tick_ms", "tick_prepare_ms", "tick_delayed_delivery_ms",
+                     "tick_propagate_ms", "tick_update_ms", "evaluation_ms",
+                     "evaluation_rust_ms", "snapshot_ms", "batch_state_ms",
+                     "trace_match_ms", "learn_step_ms", "formation_ms",
+                     "maintain_ms", "other_python_ms", "step_internal_ms"):
             vals = [t.get(key, 0) for t in all_ticks if isinstance(t.get(key), (int, float))]
             if vals:
                 summary[f"{key}_avg"] = round(sum(vals) / len(vals), 5)
@@ -234,6 +244,11 @@ class MetricsCollector:
         print(f"  Duration:         {gs.get('duration_sec', 0):.1f}s")
         print(f"  Ticks/sec:        {gs.get('ticks_per_sec', 0):.0f}")
         print(f"  Tick avg:         {gs.get('tick_time_avg_ms', 0):.2f}ms")
+        print(f"  Rust tick avg:    {gs.get('rust_tick_ms_avg', 0):.2f}ms")
+        print(f"  Propagate avg:    {gs.get('tick_propagate_ms_avg', 0):.2f}ms")
+        print(f"  Eval avg:         {gs.get('evaluation_ms_avg', 0):.2f}ms")
+        print(f"  Trace match avg:  {gs.get('trace_match_ms_avg', 0):.2f}ms")
+        print(f"  Other Python avg: {gs.get('other_python_ms_avg', 0):.2f}ms")
         print(f"  Hebbian total:    {gs.get('hebbian_updates_total', 0)}")
         print(f"  Traces formed:    {gs.get('traces_formed_total', 0)}")
         print(f"  Bindings formed:  {gs.get('bindings_formed_total', 0)}")

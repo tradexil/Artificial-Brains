@@ -13,12 +13,25 @@ from brain.utils.config import (
     INITIAL_TRACES,
     NEURONS_PER_TRACE,
     REGIONS,
+    SEED_TRACE_BUCKET_JITTER_FRACTION,
 )
+
+
+def _bucket_window(size: int, bucket_idx: int, bucket_count: int, jitter_fraction: float) -> tuple[int, int]:
+    bucket_count = max(1, min(bucket_count, size))
+    bucket_size = max(1, (size + bucket_count - 1) // bucket_count)
+    bucket_start = min(size - 1, bucket_idx * bucket_size)
+    bucket_end = min(size - 1, bucket_start + bucket_size - 1)
+    jitter = max(1, int(bucket_size * jitter_fraction))
+    window_start = max(0, bucket_start - jitter)
+    window_end = min(size - 1, bucket_end + jitter)
+    return window_start, window_end
 
 
 def spawn_traces(
     rng: random.Random | None = None,
     count: int | None = None,
+    chunk_count: int | None = None,
 ) -> TraceStore:
     """Generate random traces and return a populated TraceStore.
 
@@ -38,6 +51,9 @@ def spawn_traces(
 
     for i in range(count):
         neurons: dict[str, list[int]] = {}
+        anchor_bucket = None
+        if chunk_count is not None and chunk_count > 1:
+            anchor_bucket = rng.randrange(chunk_count)
 
         for region_name, per_trace_count in NEURONS_PER_TRACE.items():
             if per_trace_count == 0:
@@ -48,7 +64,17 @@ def spawn_traces(
 
             # Sample random neurons from this region
             n = min(per_trace_count, size)
-            selected = rng.sample(range(start, end + 1), n)
+            if anchor_bucket is None:
+                selected = rng.sample(range(start, end + 1), n)
+            else:
+                window_start, window_end = _bucket_window(
+                    size,
+                    anchor_bucket,
+                    chunk_count,
+                    SEED_TRACE_BUCKET_JITTER_FRACTION,
+                )
+                selected_local = rng.sample(range(window_start, window_end + 1), n)
+                selected = [start + local_idx for local_idx in selected_local]
             neurons[region_name] = selected
 
         trace = Trace(

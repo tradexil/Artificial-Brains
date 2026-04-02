@@ -1,6 +1,0 @@
-# Phase 11: Real learning with datasets
-datasets>=2.19
-Pillow>=10.0
-soundfile>=0.12
-numpy>=1.24
-maturin>=1.5

@@ -16,6 +16,7 @@ Tick phases:
 from __future__ import annotations
 
 import brain_core
+import time
 
 from brain.learning.hebbian import compute_effective_learning_rate
 from brain.learning.anti_hebbian import compute_anti_hebbian_rate
@@ -32,6 +33,7 @@ from brain.structures.brain_state import (
 )
 from brain.structures.trace_store import TraceStore
 from brain.utils.config import (
+    COACTIVE_TRACK_INTERVAL,
     HEBBIAN_WINDOW,
     TRACE_ACTIVATION_THRESHOLD,
     WORKING_MEMORY_CAPACITY,
@@ -140,28 +142,62 @@ class TickLoop:
 
         Returns dict with tick stats.
         """
+        step_started = time.perf_counter()
+
         # === Pre-tick: Predict what should happen ===
         self.prediction.predict(
             self.last_active_traces,
             self.working_memory.trace_ids,
         )
 
+        # Sync Python neuromodulator state into Rust before the tick so energy,
+        # focus, and prior-step arousal affect the current tick dynamics.
+        brain_core.set_neuromodulator(
+            self.neuromod.arousal,
+            self.neuromod.valence,
+            self.neuromod.focus,
+            self.neuromod.energy,
+        )
+
         # === Phase 1: Rust tick ===
         # (propagate + update + attention gain update + prediction error)
-        tick_num, active_counts, total_active = brain_core.tick()
+        rust_tick_started = time.perf_counter()
+        tick_num, active_counts, total_active, tick_profile = brain_core.tick_profiled()
+        rust_tick_ms = (time.perf_counter() - rust_tick_started) * 1000
+        tick_prepare_ms = tick_profile.get("prepare_ms", 0.0)
+        tick_delayed_delivery_ms = tick_profile.get("delayed_delivery_ms", 0.0)
+        tick_propagate_ms = tick_profile.get("propagate_ms", 0.0)
+        tick_update_ms = tick_profile.get("update_ms", 0.0)
         self.last_tick_number = tick_num
         self.last_total_active = total_active
 
         # === Phase 2: Evaluate (snapshot, trace matching, prediction, drives) ===
-        snapshot = self.history.take_snapshot(brain_core)
-
-        # Read all brain state in one FFI call (used by Phase 5, 6, 7, 8)
-        state = brain_core.batch_read_state()
-
-        # Trace activation detection
-        active_ids = snapshot.all_active_ids()
-        active_traces = self.trace_store.matching_traces(
-            active_ids, threshold=TRACE_ACTIVATION_THRESHOLD
+        evaluation_started = time.perf_counter()
+        (
+            snapshot_data,
+            active_traces,
+            state,
+            snapshot_counts,
+            snapshot_total_active,
+            evaluation_profile,
+        ) = brain_core.evaluate_tick(
+            self.trace_store.store_id,
+            0.01,
+            TRACE_ACTIVATION_THRESHOLD,
+        )
+        snapshot = self.history.push_snapshot(
+            tick_num,
+            snapshot_data,
+            total_active=snapshot_total_active,
+            region_active_counts=snapshot_counts,
+        )
+        evaluation_ms = (time.perf_counter() - evaluation_started) * 1000
+        snapshot_ms = evaluation_profile.get("snapshot_ms", 0.0)
+        batch_state_ms = evaluation_profile.get("batch_state_ms", 0.0)
+        trace_match_ms = evaluation_profile.get("trace_match_ms", 0.0)
+        evaluation_rust_ms = evaluation_profile.get(
+            "evaluation_rust_ms",
+            snapshot_ms + batch_state_ms + trace_match_ms,
         )
         self.last_active_traces = active_traces
 
@@ -178,7 +214,7 @@ class TickLoop:
         self.working_memory.update(active_traces)
 
         # Prediction error (trace-based)
-        errors = self.prediction.compute_errors(snapshot)
+        errors = self.prediction.compute_errors(snapshot.region_active_counts)
         novelty = self.prediction.global_error(errors)
         self.last_novelty = novelty
         self.prediction.apply_effects(novelty, self.neuromod)
@@ -192,6 +228,7 @@ class TickLoop:
 
         # === Phase 3: Learn (Hebbian + anti-Hebbian + coactive tracking — single FFI call) ===
         current = self.history.current
+        learn_step_ms = 0.0
         if current is not None:
             # Compute effective learning rates
             hebbian_lr = compute_effective_learning_rate(
@@ -208,15 +245,23 @@ class TickLoop:
             if active_neurons:
                 # Collect window-active neurons
                 window_active = self.history.neurons_active_in_window()
+                track_coactive = (tick_num % COACTIVE_TRACK_INTERVAL) == 0
 
                 # Single Rust FFI call: hebbian + anti-hebbian + coactive tracking
-                hebb_count, anti_count, coactive_pairs = brain_core.batch_learn_step(
-                    active_neurons, window_active, hebbian_lr, anti_hebbian_rate,
+                learn_step_started = time.perf_counter()
+                hebb_count, anti_count, coactive_pairs = brain_core.batch_learn_step_configurable(
+                    active_neurons,
+                    window_active,
+                    hebbian_lr,
+                    anti_hebbian_rate,
+                    track_coactive,
                 )
+                learn_step_ms = (time.perf_counter() - learn_step_started) * 1000
 
                 # Update synapse fire tracking for pruning
-                for src_id, tgt_id in coactive_pairs:
-                    self._synapse_last_fired[(src_id, tgt_id)] = tick_num
+                if track_coactive:
+                    for src_id, tgt_id in coactive_pairs:
+                        self._synapse_last_fired[(src_id, tgt_id)] = tick_num
             else:
                 hebb_count = 0
                 anti_count = 0
@@ -256,6 +301,7 @@ class TickLoop:
                 self._awake_trace_ids.append(tid)
 
         # Trace formation: detect persistent novel patterns
+        formation_started = time.perf_counter()
         traces_formed = self.trace_formation.step(
             snapshot,
             active_traces,
@@ -269,13 +315,23 @@ class TickLoop:
         binding_stats = self.binding_formation.step(
             active_traces, tick_num, self.history,
         )
+        formation_ms = (time.perf_counter() - formation_started) * 1000
 
         # === Phase 6: Emotion & Executive ===
 
-        # Save Python-computed arousal (from prediction engine) before Rust sync
+        # Read back Rust-computed state from the tick before syncing any Python-side
+        # prediction effects back for the next tick.
         python_arousal = self.neuromod.arousal
+        rust_arousal, rust_valence, rust_focus, rust_energy = brain_core.get_neuromodulator()
 
-        # Sync Python neuromodulator state TO Rust
+        # Combine: Python arousal (prediction-based) + Rust arousal (emotion-based)
+        # Use max to preserve signal from either source
+        self.neuromod.arousal = max(python_arousal, rust_arousal)
+        self.neuromod.valence = rust_valence
+        self.neuromod.focus = rust_focus
+        self.neuromod.energy = rust_energy
+
+        # Sync the merged neuromodulator state back to Rust for the next tick.
         brain_core.set_neuromodulator(
             self.neuromod.arousal,
             self.neuromod.valence,
@@ -283,17 +339,8 @@ class TickLoop:
             self.neuromod.energy,
         )
 
-        # Read back Rust-computed state (emotion-driven arousal, energy depletion)
-        rust_arousal, rust_valence, rust_focus, rust_energy = brain_core.get_neuromodulator()
-
-        # Combine: Python arousal (prediction-based) + Rust arousal (emotion-based)
-        # Use max to preserve signal from either source
-        self.neuromod.arousal = max(python_arousal, rust_arousal)
-        self.neuromod.valence = rust_valence
-        self.neuromod.energy = rust_energy
-
         emotion_polarity = state.get("emotion_polarity", 0.0)
-        emotion_arousal = state.get("emotion_arousal", 0.0)
+        emotion_arousal = max(state.get("emotion_arousal", 0.0), rust_arousal)
 
         # Tag active traces with emotional polarity
         if abs(emotion_polarity) > 0.1:
@@ -378,14 +425,28 @@ class TickLoop:
                 tick_num, self.trace_store,
                 self.homeostasis.get_dream_candidates(),
             )
-        elif not brain_core.is_asleep() and self.consolidation.should_consolidate(tick_num, self.neuromod):
-            # Normal awake-triggered consolidation (energy/tick based)
+        elif self.consolidation.should_consolidate(tick_num, self.neuromod):
+            # Normal consolidation trigger (energy/tick based). Keep this active
+            # even if the same low-energy tick has already pushed the brain into
+            # a drowsy sleep state.
             self.consolidation.start_consolidation(
                 tick_num, self.trace_store, self._awake_trace_ids,
             )
 
         # === Phase 4: Maintain (periodic) ===
+        maintain_started = time.perf_counter()
         self._maintain(tick_num)
+        maintain_ms = (time.perf_counter() - maintain_started) * 1000
+        step_internal_ms = (time.perf_counter() - step_started) * 1000
+        other_python_ms = max(
+            0.0,
+            step_internal_ms
+            - rust_tick_ms
+            - evaluation_ms
+            - learn_step_ms
+            - formation_ms
+            - maintain_ms,
+        )
 
         return {
             "tick": tick_num,
@@ -432,6 +493,22 @@ class TickLoop:
             "is_asleep": homeo_stats.get("is_asleep", False),
             "in_rem": homeo_stats.get("in_rem", False),
             "dream_replayed": homeo_stats.get("dream_replayed", 0),
+            # Profiling
+            "rust_tick_ms": rust_tick_ms,
+            "tick_prepare_ms": tick_prepare_ms,
+            "tick_delayed_delivery_ms": tick_delayed_delivery_ms,
+            "tick_propagate_ms": tick_propagate_ms,
+            "tick_update_ms": tick_update_ms,
+            "evaluation_ms": evaluation_ms,
+            "evaluation_rust_ms": evaluation_rust_ms,
+            "snapshot_ms": snapshot_ms,
+            "batch_state_ms": batch_state_ms,
+            "trace_match_ms": trace_match_ms,
+            "learn_step_ms": learn_step_ms,
+            "formation_ms": formation_ms,
+            "maintain_ms": maintain_ms,
+            "other_python_ms": other_python_ms,
+            "step_internal_ms": step_internal_ms,
         }
 
     def _track_synapse_fires(self, snapshot: ActivationSnapshot, tick: int) -> None:
@@ -439,7 +516,7 @@ class TickLoop:
 
         Uses Rust batch_track_coactive for parallelized synapse traversal.
         """
-        active_ids = snapshot.all_active_ids()
+        active_ids = snapshot.active_ids
         if not active_ids:
             return
         active_set = set(active_ids)

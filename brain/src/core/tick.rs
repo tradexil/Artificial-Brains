@@ -11,6 +11,21 @@ use crate::core::region::{Region, RegionId};
 use crate::core::synapse::SynapsePool;
 use rayon::prelude::*;
 use std::collections::HashMap;
+use std::time::Instant;
+
+#[derive(Debug, Clone, Default)]
+pub struct TickProfile {
+    pub prepare_ms: f64,
+    pub delayed_delivery_ms: f64,
+    pub propagate_ms: f64,
+    pub update_ms: f64,
+}
+
+impl TickProfile {
+    pub fn total_ms(&self) -> f64 {
+        self.prepare_ms + self.delayed_delivery_ms + self.propagate_ms + self.update_ms
+    }
+}
 
 /// Result of a single tick — stats for Python to consume.
 #[derive(Debug, Clone)]
@@ -18,6 +33,7 @@ pub struct TickResult {
     pub tick_number: u64,
     pub active_counts: HashMap<RegionId, u32>,
     pub total_active: u32,
+    pub profile: TickProfile,
 }
 
 /// Execute one complete tick cycle.
@@ -34,46 +50,49 @@ pub fn tick(
     attention_gains: &HashMap<RegionId, f32>,
     tick_number: u64,
 ) -> TickResult {
+    let mut profile = TickProfile::default();
+
     // Phase 0: Prepare — swap buffers, clear incoming (parallel)
+    let phase_started = Instant::now();
     regions.par_iter_mut().for_each(|region| {
         region.pre_tick();
     });
+    profile.prepare_ms = phase_started.elapsed().as_secs_f64() * 1000.0;
 
     // Phase 1a: Deliver signals that were delayed from previous ticks
+    let phase_started = Instant::now();
     deliver_delayed_signals(regions, delay_buffer);
+    profile.delayed_delivery_ms += phase_started.elapsed().as_secs_f64() * 1000.0;
 
     // Phase 1b: Propagate — active neurons push signal through synapses (parallel)
     // Propagation uses rayon internally to parallelize across regions.
+    let phase_started = Instant::now();
     propagate(regions, synapse_pool, delay_buffer, attention_gains);
+    profile.propagate_ms = phase_started.elapsed().as_secs_f64() * 1000.0;
 
     // Phase 1c: Deliver immediate signals (delay=0 scheduled this tick)
+    let phase_started = Instant::now();
     deliver_delayed_signals(regions, delay_buffer);
+    profile.delayed_delivery_ms += phase_started.elapsed().as_secs_f64() * 1000.0;
 
     // Phase 2: Update — each region integrates incoming signals (parallel)
-    regions.par_iter_mut().for_each(|region| {
-        region.update_neurons();
-    });
-
-    // Collect stats (parallel reduce)
-    let (active_counts, total_active) = regions
-        .par_iter()
+    let phase_started = Instant::now();
+    let active_counts_vec: Vec<(RegionId, u32)> = regions
+        .par_iter_mut()
         .map(|region| {
-            let count = region.active_global_ids(0.5).len() as u32;
-            (vec![(region.id, count)], count)
+            let count = region.update_neurons();
+            (region.id, count)
         })
-        .reduce(
-            || (Vec::new(), 0u32),
-            |(mut acc_map, acc_total), (map, total)| {
-                acc_map.extend(map);
-                (acc_map, acc_total + total)
-            },
-        );
-    let active_counts: HashMap<RegionId, u32> = active_counts.into_iter().collect();
+        .collect();
+    profile.update_ms = phase_started.elapsed().as_secs_f64() * 1000.0;
+    let total_active = active_counts_vec.iter().map(|(_, count)| *count).sum();
+    let active_counts: HashMap<RegionId, u32> = active_counts_vec.into_iter().collect();
 
     TickResult {
         tick_number,
         active_counts,
         total_active,
+        profile,
     }
 }
 

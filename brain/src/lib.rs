@@ -10,16 +10,26 @@ pub mod core;
 pub mod regions;
 
 use core::brain::Brain;
+use core::formation::{BindingTrackerRegistry, NovelPatternRegistry};
 use core::region::RegionId;
 use core::synapse::SynapseData;
+use core::tick::TickProfile;
+use core::trace_match::TraceMatcherRegistry;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
+use std::time::Instant;
 
 // Global brain instance, protected by mutex.
 // Python holds no Rust pointers — all access goes through these functions.
 static BRAIN: Mutex<Option<Brain>> = Mutex::new(None);
+static TRACE_MATCHERS: LazyLock<Mutex<TraceMatcherRegistry>> =
+    LazyLock::new(|| Mutex::new(TraceMatcherRegistry::new()));
+static NOVEL_TRACKERS: LazyLock<Mutex<NovelPatternRegistry>> =
+    LazyLock::new(|| Mutex::new(NovelPatternRegistry::new()));
+static BINDING_TRACKERS: LazyLock<Mutex<BindingTrackerRegistry>> =
+    LazyLock::new(|| Mutex::new(BindingTrackerRegistry::new()));
 
 // === THREAD POOL CONTROL ===
 
@@ -44,6 +54,23 @@ fn get_num_threads() -> PyResult<usize> {
 
 use rayon::prelude::*;
 
+const LEARNING_CHUNK_SIZE: usize = 256;
+
+type NamedActivations = HashMap<String, Vec<(u32, f32)>>;
+type NamedActiveCounts = HashMap<String, u32>;
+type NamedState = HashMap<String, f64>;
+type NamedProfile = HashMap<String, f64>;
+
+fn dense_window_activity(window_active: &HashMap<u32, f32>, num_neurons: u32) -> Vec<f32> {
+    let mut dense = vec![0.0f32; num_neurons as usize];
+    for (&neuron_id, &activation) in window_active {
+        if neuron_id < num_neurons {
+            dense[neuron_id as usize] = activation;
+        }
+    }
+    dense
+}
+
 /// Batch Hebbian update: for each active neuron, traverse outgoing synapses
 /// and strengthen those whose target was also active in the window.
 ///
@@ -59,24 +86,28 @@ fn batch_hebbian(
     let lr = learning_rate as f32;
     with_brain(|brain| {
         let nn = brain.synapse_pool.num_neurons();
+        let window_activity = dense_window_activity(&window_active, nn);
+
         // Parallel phase: each active neuron independently collects updates
         let all_updates: Vec<Vec<(u32, u32, f32)>> = active_neurons
-            .par_iter()
-            .map(|&(src_id, src_act)| {
+            .par_chunks(LEARNING_CHUNK_SIZE)
+            .map(|chunk| {
                 let mut updates = Vec::new();
-                if src_id >= nn {
-                    return updates;
-                }
-                let start = brain.synapse_pool.offsets[src_id as usize] as usize;
-                let end = brain.synapse_pool.offsets[src_id as usize + 1] as usize;
-
-                for i in start..end {
-                    let plasticity = brain.synapse_pool.plasticity[i];
-                    if plasticity < 0.01 {
+                for &(src_id, src_act) in chunk {
+                    if src_id >= nn {
                         continue;
                     }
-                    let tgt_id = brain.synapse_pool.targets[i];
-                    if let Some(&tgt_act) = window_active.get(&tgt_id) {
+
+                    let start = brain.synapse_pool.offsets[src_id as usize] as usize;
+                    let end = brain.synapse_pool.offsets[src_id as usize + 1] as usize;
+
+                    for i in start..end {
+                        let plasticity = brain.synapse_pool.plasticity[i];
+                        if plasticity < 0.01 {
+                            continue;
+                        }
+                        let tgt_id = brain.synapse_pool.targets[i];
+                        let tgt_act = window_activity[tgt_id as usize];
                         if tgt_act > 0.0 {
                             let delta = lr * src_act * tgt_act * plasticity;
                             if delta > 0.0001 {
@@ -115,29 +146,34 @@ fn batch_anti_hebbian(
     let r = rate as f32;
     with_brain(|brain| {
         let nn = brain.synapse_pool.num_neurons();
-        let all_updates: Vec<Vec<(u32, u32, f32)>> = active_neurons
-            .par_iter()
-            .map(|&(src_id, src_act)| {
-                let mut updates = Vec::new();
-                if src_id >= nn {
-                    return updates;
-                }
-                let start = brain.synapse_pool.offsets[src_id as usize] as usize;
-                let end = brain.synapse_pool.offsets[src_id as usize + 1] as usize;
+        let window_activity = dense_window_activity(&window_active, nn);
 
-                for i in start..end {
-                    let plasticity = brain.synapse_pool.plasticity[i];
-                    if plasticity < 0.01 {
+        let all_updates: Vec<Vec<(u32, u32, f32)>> = active_neurons
+            .par_chunks(LEARNING_CHUNK_SIZE)
+            .map(|chunk| {
+                let mut updates = Vec::new();
+                for &(src_id, src_act) in chunk {
+                    if src_id >= nn {
                         continue;
                     }
-                    let tgt_id = brain.synapse_pool.targets[i];
-                    let tgt_act = window_active.get(&tgt_id).copied().unwrap_or(0.0);
-                    if tgt_act > 0.0 {
-                        continue; // Target active — Hebbian handles this
-                    }
-                    let delta = -r * src_act * (1.0 - tgt_act) * plasticity;
-                    if delta < -0.0001 {
-                        updates.push((src_id, tgt_id, delta));
+
+                    let start = brain.synapse_pool.offsets[src_id as usize] as usize;
+                    let end = brain.synapse_pool.offsets[src_id as usize + 1] as usize;
+
+                    for i in start..end {
+                        let plasticity = brain.synapse_pool.plasticity[i];
+                        if plasticity < 0.01 {
+                            continue;
+                        }
+                        let tgt_id = brain.synapse_pool.targets[i];
+                        let tgt_act = window_activity[tgt_id as usize];
+                        if tgt_act > 0.0 {
+                            continue; // Target active — Hebbian handles this
+                        }
+                        let delta = -r * src_act * (1.0 - tgt_act) * plasticity;
+                        if delta < -0.0001 {
+                            updates.push((src_id, tgt_id, delta));
+                        }
                     }
                 }
                 updates
@@ -201,51 +237,68 @@ fn batch_learn_step(
     hebbian_rate: f64,
     anti_hebbian_rate: f64,
 ) -> PyResult<(usize, usize, Vec<(u32, u32)>)> {
+    batch_learn_step_inner(
+        active_neurons,
+        window_active,
+        hebbian_rate,
+        anti_hebbian_rate,
+        true,
+    )
+}
+
+fn batch_learn_step_inner(
+    active_neurons: Vec<(u32, f32)>,
+    window_active: HashMap<u32, f32>,
+    hebbian_rate: f64,
+    anti_hebbian_rate: f64,
+    track_coactive: bool,
+) -> PyResult<(usize, usize, Vec<(u32, u32)>)> {
     let h_lr = hebbian_rate as f32;
     let a_lr = anti_hebbian_rate as f32;
     with_brain(|brain| {
         let nn = brain.synapse_pool.num_neurons();
-        let window_set: std::collections::HashSet<u32> = window_active.keys().copied().collect();
+        let window_activity = dense_window_activity(&window_active, nn);
 
         // Parallel phase: each active neuron does hebbian + anti-hebbian + coactive
-        let results: Vec<(Vec<(u32, u32, f32)>, Vec<(u32, u32, f32)>, Vec<(u32, u32)>)> = 
+        let results: Vec<(Vec<(u32, u32, f32)>, Vec<(u32, u32, f32)>, Vec<(u32, u32)>)> =
             active_neurons
-                .par_iter()
-                .map(|&(src_id, src_act)| {
+                .par_chunks(LEARNING_CHUNK_SIZE)
+                .map(|chunk| {
                     let mut hebb_updates = Vec::new();
                     let mut anti_updates = Vec::new();
                     let mut coactive = Vec::new();
-                    
-                    if src_id >= nn {
-                        return (hebb_updates, anti_updates, coactive);
-                    }
-                    
-                    let start = brain.synapse_pool.offsets[src_id as usize] as usize;
-                    let end = brain.synapse_pool.offsets[src_id as usize + 1] as usize;
 
-                    for i in start..end {
-                        let tgt_id = brain.synapse_pool.targets[i];
-                        let plasticity = brain.synapse_pool.plasticity[i];
-                        let tgt_act = window_active.get(&tgt_id).copied().unwrap_or(0.0);
-                        
-                        if tgt_act > 0.0 {
-                            // Hebbian: both fire → strengthen
-                            if plasticity >= 0.01 {
-                                let delta = h_lr * src_act * tgt_act * plasticity;
-                                if delta > 0.0001 {
-                                    hebb_updates.push((src_id, tgt_id, delta));
+                    for &(src_id, src_act) in chunk {
+                        if src_id >= nn {
+                            continue;
+                        }
+
+                        let start = brain.synapse_pool.offsets[src_id as usize] as usize;
+                        let end = brain.synapse_pool.offsets[src_id as usize + 1] as usize;
+
+                        for i in start..end {
+                            let tgt_id = brain.synapse_pool.targets[i];
+                            let plasticity = brain.synapse_pool.plasticity[i];
+                            let tgt_act = window_activity[tgt_id as usize];
+
+                            if tgt_act > 0.0 {
+                                // Hebbian: both fire → strengthen
+                                if plasticity >= 0.01 {
+                                    let delta = h_lr * src_act * tgt_act * plasticity;
+                                    if delta > 0.0001 {
+                                        hebb_updates.push((src_id, tgt_id, delta));
+                                    }
                                 }
-                            }
-                            // Coactive tracking
-                            if window_set.contains(&tgt_id) {
-                                coactive.push((src_id, tgt_id));
-                            }
-                        } else {
-                            // Anti-Hebbian: src fires, tgt doesn't → weaken
-                            if plasticity >= 0.01 {
-                                let delta = -a_lr * src_act * plasticity;
-                                if delta < -0.0001 {
-                                    anti_updates.push((src_id, tgt_id, delta));
+                                if track_coactive {
+                                    coactive.push((src_id, tgt_id));
+                                }
+                            } else {
+                                // Anti-Hebbian: src fires, tgt doesn't → weaken
+                                if plasticity >= 0.01 {
+                                    let delta = -a_lr * src_act * plasticity;
+                                    if delta < -0.0001 {
+                                        anti_updates.push((src_id, tgt_id, delta));
+                                    }
                                 }
                             }
                         }
@@ -257,8 +310,8 @@ fn batch_learn_step(
         // Sequential phase: queue all updates and collect coactive pairs
         let mut hebb_total = 0usize;
         let mut anti_total = 0usize;
-        let mut all_coactive = Vec::new();
-        
+        let mut all_coactive = if track_coactive { Vec::new() } else { Vec::with_capacity(0) };
+
         for (hebb, anti, coact) in results {
             hebb_total += hebb.len();
             for (from, to, delta) in hebb {
@@ -268,11 +321,33 @@ fn batch_learn_step(
             for (from, to, delta) in anti {
                 brain.synapse_pool.queue_update(from, to, delta);
             }
-            all_coactive.extend(coact);
+            if track_coactive {
+                all_coactive.extend(coact);
+            }
         }
-        
+
         (hebb_total, anti_total, all_coactive)
     })
+}
+
+/// Combined learning step with optional coactive synapse export.
+/// When `track_coactive` is false, Hebbian/anti-Hebbian still run but Python
+/// avoids paying to receive and process every co-active edge on that tick.
+#[pyfunction]
+fn batch_learn_step_configurable(
+    active_neurons: Vec<(u32, f32)>,
+    window_active: HashMap<u32, f32>,
+    hebbian_rate: f64,
+    anti_hebbian_rate: f64,
+    track_coactive: bool,
+) -> PyResult<(usize, usize, Vec<(u32, u32)>)> {
+    batch_learn_step_inner(
+        active_neurons,
+        window_active,
+        hebbian_rate,
+        anti_hebbian_rate,
+        track_coactive,
+    )
 }
 
 /// Set attention drives for all regions at once (batch version).
@@ -290,61 +365,109 @@ fn batch_set_attention_drives(
     })
 }
 
+fn read_state_from_brain(brain: &Brain) -> NamedState {
+    let mut state = HashMap::new();
+
+    // Region activation levels
+    state.insert("sensory_activation".to_string(), brain.cached_sensory_activation() as f64);
+    state.insert("visual_activation".to_string(), brain.cached_visual_activation() as f64);
+    state.insert("audio_activation".to_string(), brain.cached_audio_activation() as f64);
+    state.insert("motor_activation".to_string(), brain.cached_motor_activation() as f64);
+    state.insert("language_activation".to_string(), brain.cached_language_activation() as f64);
+    state.insert("speech_activity".to_string(), brain.cached_speech_activity() as f64);
+
+    // Emotion
+    state.insert("emotion_polarity".to_string(), brain.emotion_polarity() as f64);
+    state.insert("emotion_arousal".to_string(), brain.cached_emotion_arousal() as f64);
+
+    // Executive
+    state.insert(
+        "executive_engagement".to_string(),
+        brain.cached_executive_engagement() as f64,
+    );
+    state.insert("motor_conflict".to_string(), brain.motor_conflict() as f64);
+    state.insert("planning_signal".to_string(), brain.cached_planning_signal() as f64);
+
+    // Motor decode
+    match brain.decode_motor_action() {
+        crate::regions::motor::MotorAction::Idle => {
+            state.insert("motor_approach".to_string(), 0.0);
+            state.insert("motor_withdraw".to_string(), 0.0);
+        }
+        crate::regions::motor::MotorAction::Approach { strength } => {
+            state.insert("motor_approach".to_string(), strength as f64);
+            state.insert("motor_withdraw".to_string(), 0.0);
+        }
+        crate::regions::motor::MotorAction::Withdraw { strength } => {
+            state.insert("motor_approach".to_string(), 0.0);
+            state.insert("motor_withdraw".to_string(), strength as f64);
+        }
+        crate::regions::motor::MotorAction::Conflict { approach, withdraw } => {
+            state.insert("motor_approach".to_string(), approach as f64);
+            state.insert("motor_withdraw".to_string(), withdraw as f64);
+        }
+    }
+
+    // Inner monologue
+    state.insert("inner_monologue".to_string(), brain.inner_monologue_signal() as f64);
+
+    // Pain
+    state.insert("pain_level".to_string(), brain.detect_pain() as f64);
+
+    // Integration
+    state.insert(
+        "integration_input_count".to_string(),
+        brain.integration_input_count(0.5) as f64,
+    );
+
+    state
+}
+
+fn collect_named_activations(
+    brain: &Brain,
+    min_activation: f32,
+) -> (NamedActivations, Vec<u32>, NamedActiveCounts, u32) {
+    let mut all_activations = HashMap::new();
+    let mut active_ids = Vec::new();
+    let mut active_counts = HashMap::new();
+    let mut total_active = 0u32;
+
+    for region in &brain.regions {
+        let mut region_acts = Vec::new();
+        for (local_idx, &activation) in region.neurons.activations.iter().enumerate() {
+            if activation > min_activation {
+                let global_id = region.local_to_global(local_idx as u32);
+                region_acts.push((global_id, activation));
+                active_ids.push(global_id);
+            }
+        }
+
+        let count = region_acts.len() as u32;
+        active_counts.insert(region.id.name().to_string(), count);
+        total_active += count;
+        if !region_acts.is_empty() {
+            all_activations.insert(region.id.name().to_string(), region_acts);
+        }
+    }
+
+    (all_activations, active_ids, active_counts, total_active)
+}
+
+fn build_tick_profile_map(profile: &TickProfile) -> NamedProfile {
+    let mut data = HashMap::new();
+    data.insert("prepare_ms".to_string(), profile.prepare_ms);
+    data.insert("delayed_delivery_ms".to_string(), profile.delayed_delivery_ms);
+    data.insert("propagate_ms".to_string(), profile.propagate_ms);
+    data.insert("update_ms".to_string(), profile.update_ms);
+    data.insert("tick_profile_ms".to_string(), profile.total_ms());
+    data
+}
+
 /// Read all brain state needed for Python learning in one call.
 /// Returns a dict with all activation levels, emotion, executive, motor, etc.
 #[pyfunction]
 fn batch_read_state() -> PyResult<HashMap<String, f64>> {
-    with_brain_ref(|brain| {
-        let mut state = HashMap::new();
-        
-        // Region activation levels
-        state.insert("sensory_activation".to_string(), brain.sensory_activation() as f64);
-        state.insert("visual_activation".to_string(), brain.visual_activation() as f64);
-        state.insert("audio_activation".to_string(), brain.audio_activation() as f64);
-        state.insert("motor_activation".to_string(), brain.motor_activation() as f64);
-        state.insert("language_activation".to_string(), brain.language_activation() as f64);
-        state.insert("speech_activity".to_string(), brain.speech_activity() as f64);
-        
-        // Emotion
-        state.insert("emotion_polarity".to_string(), brain.emotion_polarity() as f64);
-        state.insert("emotion_arousal".to_string(), brain.emotion_arousal() as f64);
-        
-        // Executive
-        state.insert("executive_engagement".to_string(), brain.executive_engagement() as f64);
-        state.insert("motor_conflict".to_string(), brain.motor_conflict() as f64);
-        state.insert("planning_signal".to_string(), brain.planning_signal() as f64);
-        
-        // Motor decode
-        match brain.decode_motor_action() {
-            crate::regions::motor::MotorAction::Idle => {
-                state.insert("motor_approach".to_string(), 0.0);
-                state.insert("motor_withdraw".to_string(), 0.0);
-            }
-            crate::regions::motor::MotorAction::Approach { strength } => {
-                state.insert("motor_approach".to_string(), strength as f64);
-                state.insert("motor_withdraw".to_string(), 0.0);
-            }
-            crate::regions::motor::MotorAction::Withdraw { strength } => {
-                state.insert("motor_approach".to_string(), 0.0);
-                state.insert("motor_withdraw".to_string(), strength as f64);
-            }
-            crate::regions::motor::MotorAction::Conflict { approach, withdraw } => {
-                state.insert("motor_approach".to_string(), approach as f64);
-                state.insert("motor_withdraw".to_string(), withdraw as f64);
-            }
-        }
-        
-        // Inner monologue  
-        state.insert("inner_monologue".to_string(), brain.inner_monologue_signal() as f64);
-        
-        // Pain
-        state.insert("pain_level".to_string(), brain.detect_pain() as f64);
-        
-        // Integration
-        state.insert("integration_input_count".to_string(), brain.integration_input_count(0.5) as f64);
-        
-        state
-    })
+    with_brain_ref(|brain| read_state_from_brain(brain))
 }
 
 fn with_brain<F, R>(f: F) -> PyResult<R>
@@ -367,6 +490,36 @@ where
         Some(brain) => Ok(f(brain)),
         None => Err(PyValueError::new_err("Brain not initialized. Call init_brain() first.")),
     }
+}
+
+fn with_trace_matchers<F, R>(f: F) -> PyResult<R>
+where
+    F: FnOnce(&mut TraceMatcherRegistry) -> R,
+{
+    let mut guard = TRACE_MATCHERS
+        .lock()
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    Ok(f(&mut guard))
+}
+
+fn with_novel_trackers<F, R>(f: F) -> PyResult<R>
+where
+    F: FnOnce(&mut NovelPatternRegistry) -> R,
+{
+    let mut guard = NOVEL_TRACKERS
+        .lock()
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    Ok(f(&mut guard))
+}
+
+fn with_binding_trackers<F, R>(f: F) -> PyResult<R>
+where
+    F: FnOnce(&mut BindingTrackerRegistry) -> R,
+{
+    let mut guard = BINDING_TRACKERS
+        .lock()
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    Ok(f(&mut guard))
 }
 
 // === INITIALIZATION ===
@@ -397,6 +550,121 @@ fn reset_brain() -> PyResult<()> {
     with_brain(|brain| brain.reset())
 }
 
+// === TRACE MATCHING INDEX ===
+
+#[pyfunction]
+fn trace_index_create(store_id: u64) -> PyResult<()> {
+    with_trace_matchers(|registry| registry.create_store(store_id))
+}
+
+#[pyfunction]
+fn trace_index_clear(store_id: u64) -> PyResult<()> {
+    with_trace_matchers(|registry| registry.clear_store(store_id))
+}
+
+#[pyfunction]
+fn trace_index_drop(store_id: u64) -> PyResult<()> {
+    with_trace_matchers(|registry| registry.drop_store(store_id))
+}
+
+#[pyfunction]
+fn trace_index_upsert_trace(store_id: u64, trace_id: String, neurons: Vec<u32>) -> PyResult<()> {
+    with_trace_matchers(|registry| registry.upsert_trace(store_id, trace_id, neurons))
+}
+
+#[pyfunction]
+fn trace_index_remove_trace(store_id: u64, trace_id: &str) -> PyResult<()> {
+    with_trace_matchers(|registry| registry.remove_trace(store_id, trace_id))
+}
+
+#[pyfunction]
+fn trace_index_matching_traces(
+    store_id: u64,
+    active_neurons: Vec<u32>,
+    threshold: f64,
+) -> PyResult<Vec<(String, f64)>> {
+    with_trace_matchers(|registry| {
+        registry
+            .matching_traces(store_id, &active_neurons, threshold as f32)
+            .into_iter()
+            .map(|(trace_id, score)| (trace_id, score as f64))
+            .collect::<Vec<_>>()
+    })
+}
+
+// === FORMATION TRACKERS ===
+
+#[pyfunction]
+fn novel_tracker_create(tracker_id: u64) -> PyResult<()> {
+    with_novel_trackers(|registry| registry.create_tracker(tracker_id))
+}
+
+#[pyfunction]
+fn novel_tracker_clear(tracker_id: u64) -> PyResult<()> {
+    with_novel_trackers(|registry| registry.clear_tracker(tracker_id))
+}
+
+#[pyfunction]
+fn novel_tracker_drop(tracker_id: u64) -> PyResult<()> {
+    with_novel_trackers(|registry| registry.drop_tracker(tracker_id))
+}
+
+#[pyfunction]
+fn novel_tracker_update(
+    tracker_id: u64,
+    region_neurons: HashMap<String, Vec<u32>>,
+    novelty: f64,
+    min_regions: usize,
+    persistence_required: usize,
+) -> PyResult<Vec<HashMap<String, Vec<u32>>>> {
+    with_novel_trackers(|registry| {
+        registry.update(
+            tracker_id,
+            region_neurons,
+            novelty as f32,
+            min_regions,
+            persistence_required,
+        )
+    })
+}
+
+#[pyfunction]
+fn binding_tracker_create(tracker_id: u64) -> PyResult<()> {
+    with_binding_trackers(|registry| registry.create_tracker(tracker_id))
+}
+
+#[pyfunction]
+fn binding_tracker_clear(tracker_id: u64) -> PyResult<()> {
+    with_binding_trackers(|registry| registry.clear_tracker(tracker_id))
+}
+
+#[pyfunction]
+fn binding_tracker_drop(tracker_id: u64) -> PyResult<()> {
+    with_binding_trackers(|registry| registry.drop_tracker(tracker_id))
+}
+
+#[pyfunction]
+fn binding_tracker_record(
+    tracker_id: u64,
+    active_patterns: Vec<(String, String)>,
+    tick: u64,
+    formation_count: usize,
+    temporal_window: u64,
+) -> PyResult<Vec<(String, String, String, String, f64)>> {
+    with_binding_trackers(|registry| {
+        registry
+            .record(tracker_id, active_patterns, tick, formation_count, temporal_window)
+            .into_iter()
+            .map(|(a, ar, b, br, delta)| (a, ar, b, br, delta as f64))
+            .collect::<Vec<_>>()
+    })
+}
+
+#[pyfunction]
+fn binding_tracker_cleanup(tracker_id: u64, current_tick: u64, max_age: u64) -> PyResult<()> {
+    with_binding_trackers(|registry| registry.cleanup(tracker_id, current_tick, max_age))
+}
+
 // === TICK CONTROL ===
 
 #[pyfunction]
@@ -410,6 +678,88 @@ fn tick() -> PyResult<(u64, HashMap<String, u32>, u32)> {
             .collect();
         (result.tick_number, named_counts, result.total_active)
     })
+}
+
+#[pyfunction]
+fn tick_profiled() -> PyResult<(u64, HashMap<String, u32>, u32, NamedProfile)> {
+    with_brain(|brain| {
+        let result = brain.tick();
+        let named_counts: HashMap<String, u32> = result
+            .active_counts
+            .into_iter()
+            .map(|(id, count)| (id.name().to_string(), count))
+            .collect();
+        let profile = build_tick_profile_map(&result.profile);
+        (result.tick_number, named_counts, result.total_active, profile)
+    })
+}
+
+#[pyfunction]
+fn evaluate_tick(
+    store_id: u64,
+    min_activation: f32,
+    threshold: f64,
+) -> PyResult<(NamedActivations, Vec<(String, f64)>, NamedState, NamedActiveCounts, u32, NamedProfile)> {
+    let (
+        activations,
+        active_ids,
+        active_counts,
+        total_active,
+        snapshot_ms,
+        state,
+        batch_state_ms,
+    ) = with_brain_ref(|brain| {
+        let snapshot_started = Instant::now();
+        let (activations, active_ids, active_counts, total_active) =
+            collect_named_activations(brain, min_activation);
+        let snapshot_ms = snapshot_started.elapsed().as_secs_f64() * 1000.0;
+
+        let batch_state_started = Instant::now();
+        let state = read_state_from_brain(brain);
+        let batch_state_ms = batch_state_started.elapsed().as_secs_f64() * 1000.0;
+
+        (
+            activations,
+            active_ids,
+            active_counts,
+            total_active,
+            snapshot_ms,
+            state,
+            batch_state_ms,
+        )
+    })?;
+
+    let trace_match_started = Instant::now();
+    let active_traces = if active_ids.is_empty() {
+        Vec::new()
+    } else {
+        with_trace_matchers(|registry| {
+            registry
+                .matching_traces(store_id, &active_ids, threshold as f32)
+                .into_iter()
+                .map(|(trace_id, score)| (trace_id, score as f64))
+                .collect::<Vec<_>>()
+        })?
+    };
+    let trace_match_ms = trace_match_started.elapsed().as_secs_f64() * 1000.0;
+
+    let mut profile = HashMap::new();
+    profile.insert("snapshot_ms".to_string(), snapshot_ms);
+    profile.insert("batch_state_ms".to_string(), batch_state_ms);
+    profile.insert("trace_match_ms".to_string(), trace_match_ms);
+    profile.insert(
+        "evaluation_rust_ms".to_string(),
+        snapshot_ms + batch_state_ms + trace_match_ms,
+    );
+
+    Ok((
+        activations,
+        active_traces,
+        state,
+        active_counts,
+        total_active,
+        profile,
+    ))
 }
 
 #[pyfunction]
@@ -460,11 +810,7 @@ fn get_neuron_potential(neuron_id: u32) -> PyResult<f32> {
 fn get_active_count(region_name: &str) -> PyResult<u32> {
     let region_id = RegionId::from_name(region_name)
         .ok_or_else(|| PyValueError::new_err(format!("Unknown region: {}", region_name)))?;
-    with_brain_ref(|brain| {
-        brain.region(region_id)
-            .map(|r| r.active_global_ids(0.5).len() as u32)
-            .unwrap_or(0)
-    })
+    with_brain_ref(|brain| brain.active_count(region_id))
 }
 
 #[pyfunction]
@@ -514,6 +860,22 @@ fn get_neuron_count() -> PyResult<u32> {
 #[pyfunction]
 fn get_synapse_count() -> PyResult<u64> {
     with_brain_ref(|brain| brain.synapse_count())
+}
+
+#[pyfunction]
+fn get_synapse_chunk_stats() -> PyResult<HashMap<String, f64>> {
+    with_brain_ref(|brain| {
+        let (chunk_count, chunk_size, local_count, cross_count, cross_fraction) =
+            brain.synapse_pool.chunk_stats();
+        let mut stats = HashMap::new();
+        stats.insert("chunk_count".to_string(), chunk_count as f64);
+        stats.insert("chunk_size".to_string(), chunk_size as f64);
+        stats.insert("local_synapses".to_string(), local_count as f64);
+        stats.insert("cross_synapses".to_string(), cross_count as f64);
+        stats.insert("cross_fraction".to_string(), cross_fraction);
+        stats.insert("local_fraction".to_string(), 1.0 - cross_fraction);
+        stats
+    })
 }
 
 /// Get all outgoing synapses for a given source neuron.
@@ -1030,7 +1392,24 @@ fn brain_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(reset_brain, m)?)?;
 
     m.add_function(wrap_pyfunction!(tick, m)?)?;
+    m.add_function(wrap_pyfunction!(tick_profiled, m)?)?;
+    m.add_function(wrap_pyfunction!(evaluate_tick, m)?)?;
     m.add_function(wrap_pyfunction!(get_tick_count, m)?)?;
+    m.add_function(wrap_pyfunction!(trace_index_create, m)?)?;
+    m.add_function(wrap_pyfunction!(trace_index_clear, m)?)?;
+    m.add_function(wrap_pyfunction!(trace_index_drop, m)?)?;
+    m.add_function(wrap_pyfunction!(trace_index_upsert_trace, m)?)?;
+    m.add_function(wrap_pyfunction!(trace_index_remove_trace, m)?)?;
+    m.add_function(wrap_pyfunction!(trace_index_matching_traces, m)?)?;
+    m.add_function(wrap_pyfunction!(novel_tracker_create, m)?)?;
+    m.add_function(wrap_pyfunction!(novel_tracker_clear, m)?)?;
+    m.add_function(wrap_pyfunction!(novel_tracker_drop, m)?)?;
+    m.add_function(wrap_pyfunction!(novel_tracker_update, m)?)?;
+    m.add_function(wrap_pyfunction!(binding_tracker_create, m)?)?;
+    m.add_function(wrap_pyfunction!(binding_tracker_clear, m)?)?;
+    m.add_function(wrap_pyfunction!(binding_tracker_drop, m)?)?;
+    m.add_function(wrap_pyfunction!(binding_tracker_record, m)?)?;
+    m.add_function(wrap_pyfunction!(binding_tracker_cleanup, m)?)?;
 
     m.add_function(wrap_pyfunction!(inject_activations, m)?)?;
     m.add_function(wrap_pyfunction!(set_attention_gain, m)?)?;
@@ -1049,6 +1428,7 @@ fn brain_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(rebuild_synapse_index, m)?)?;
     m.add_function(wrap_pyfunction!(get_neuron_count, m)?)?;
     m.add_function(wrap_pyfunction!(get_synapse_count, m)?)?;
+    m.add_function(wrap_pyfunction!(get_synapse_chunk_stats, m)?)?;
     m.add_function(wrap_pyfunction!(get_outgoing_synapses, m)?)?;
     m.add_function(wrap_pyfunction!(batch_update_synapses, m)?)?;
     m.add_function(wrap_pyfunction!(batch_prune_synapses, m)?)?;
@@ -1147,6 +1527,9 @@ fn brain_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(batch_learn_step, m)?)?;
     m.add_function(wrap_pyfunction!(batch_set_attention_drives, m)?)?;
     m.add_function(wrap_pyfunction!(batch_read_state, m)?)?;
+    m.add_function(wrap_pyfunction!(batch_learn_step_configurable, m)?)?;
+
+
 
     Ok(())
 }

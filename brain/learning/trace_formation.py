@@ -13,8 +13,10 @@ and frequently co-activate, merge them.
 
 from __future__ import annotations
 
+import itertools
 import uuid
-from collections import defaultdict
+
+import brain_core
 
 from brain.structures.brain_state import ActivationSnapshot
 from brain.structures.trace_store import Trace, TraceStore
@@ -26,14 +28,21 @@ from brain.utils.config import (
 )
 
 
+_NOVEL_TRACKER_ID_COUNTER = itertools.count(1)
+
+
 class NovelPatternTracker:
     """Tracks persistent novel activation patterns as candidates for trace formation."""
 
     def __init__(self):
-        # Fingerprint → consecutive tick count
-        self._persistence: dict[frozenset[int], int] = {}
-        # Fingerprint → per-region neuron lists
-        self._pattern_neurons: dict[frozenset[int], dict[str, list[int]]] = {}
+        self._tracker_id = next(_NOVEL_TRACKER_ID_COUNTER)
+        brain_core.novel_tracker_create(self._tracker_id)
+
+    def __del__(self):
+        try:
+            brain_core.novel_tracker_drop(self._tracker_id)
+        except Exception:
+            pass
 
     def update(
         self,
@@ -45,62 +54,18 @@ class NovelPatternTracker:
 
         Returns list of region→neuron dicts for patterns ready to become traces.
         """
-        # Build current pattern fingerprint
-        current_neurons: dict[str, list[int]] = {}
-        all_ids: set[int] = set()
-        for region_name, neurons in snapshot.active_neurons.items():
-            nids = [nid for nid, _ in neurons]
-            if nids:
-                current_neurons[region_name] = nids
-                all_ids.update(nids)
-
-        # Skip tracking at low novelty but don't clear persistence
-        # (allows patterns to survive rest ticks between samples)
-        if novelty < 0.1:
-            return []
-
-        if len(current_neurons) < TRACE_FORMATION_MIN_REGIONS:
-            return []
-
-        fingerprint = frozenset(all_ids)
-
-        # Check for approximate match with existing tracked patterns
-        matched_fp = None
-        for existing_fp in list(self._persistence.keys()):
-            overlap = len(fingerprint & existing_fp)
-            union = len(fingerprint | existing_fp)
-            if union > 0 and overlap / union > 0.5:
-                matched_fp = existing_fp
-                break
-
-        if matched_fp is not None:
-            self._persistence[matched_fp] += 1
-            # Update neuron assignments (use latest)
-            self._pattern_neurons[matched_fp] = current_neurons
-        else:
-            # New novel pattern
-            self._persistence[fingerprint] = 1
-            self._pattern_neurons[fingerprint] = current_neurons
-
-        # Check which patterns have persisted long enough
-        ready = []
-        expired = []
-        for fp, count in self._persistence.items():
-            if count >= TRACE_FORMATION_PERSISTENCE:
-                ready.append(self._pattern_neurons[fp])
-                expired.append(fp)
-
-        for fp in expired:
-            del self._persistence[fp]
-            del self._pattern_neurons[fp]
-
-        # Cleanup stale patterns (haven't been seen recently)
-        stale = [fp for fp, count in self._persistence.items() if count < 0]
-        for fp in stale:
-            del self._persistence[fp]
-            del self._pattern_neurons[fp]
-
-        return ready
+        current_neurons = {
+            region_name: [nid for nid, _ in neurons]
+            for region_name, neurons in snapshot.active_neurons.items()
+            if neurons
+        }
+        return brain_core.novel_tracker_update(
+            self._tracker_id,
+            current_neurons,
+            novelty,
+            TRACE_FORMATION_MIN_REGIONS,
+            TRACE_FORMATION_PERSISTENCE,
+        )
 
 
 class TraceFormationEngine:
@@ -238,3 +203,5 @@ class TraceFormationEngine:
         for nids in from_trace.neurons.values():
             for nid in nids:
                 self.trace_store._neuron_to_traces[nid].add(into.id)
+
+        self.trace_store.sync_trace(into.id)

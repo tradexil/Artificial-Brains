@@ -6,11 +6,17 @@ The inverted index maps neuron_id → list of trace_ids for fast matching.
 
 from __future__ import annotations
 
+import itertools
 import json
 import os
 import random
 from collections import defaultdict
 from dataclasses import dataclass, field
+
+import brain_core
+
+
+_STORE_ID_COUNTER = itertools.count(1)
 
 
 @dataclass
@@ -91,6 +97,36 @@ class TraceStore:
         self.traces: dict[str, Trace] = {}
         # Inverted index: neuron_id → set of trace_ids
         self._neuron_to_traces: dict[int, set[str]] = defaultdict(set)
+        self._store_id = next(_STORE_ID_COUNTER)
+        brain_core.trace_index_create(self._store_id)
+
+    def __del__(self):
+        try:
+            brain_core.trace_index_drop(self._store_id)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _flatten_trace_neurons(trace: Trace) -> list[int]:
+        neurons: list[int] = []
+        for neuron_ids in trace.neurons.values():
+            neurons.extend(neuron_ids)
+        return neurons
+
+    def sync_trace(self, trace_id: str) -> None:
+        trace = self.traces.get(trace_id)
+        if trace is None:
+            return
+        brain_core.trace_index_upsert_trace(
+            self._store_id,
+            trace.id,
+            self._flatten_trace_neurons(trace),
+        )
+
+    def clear(self) -> None:
+        self.traces.clear()
+        self._neuron_to_traces.clear()
+        brain_core.trace_index_clear(self._store_id)
 
     def add(self, trace: Trace) -> None:
         """Add a trace and update inverted index."""
@@ -98,6 +134,7 @@ class TraceStore:
         for neurons in trace.neurons.values():
             for nid in neurons:
                 self._neuron_to_traces[nid].add(trace.id)
+        self.sync_trace(trace.id)
 
     def remove(self, trace_id: str) -> Trace | None:
         """Remove a trace and clean inverted index."""
@@ -107,6 +144,7 @@ class TraceStore:
         for neurons in trace.neurons.values():
             for nid in neurons:
                 self._neuron_to_traces[nid].discard(trace_id)
+        brain_core.trace_index_remove_trace(self._store_id, trace_id)
         return trace
 
     def get(self, trace_id: str) -> Trace | None:
@@ -117,6 +155,10 @@ class TraceStore:
 
     def __contains__(self, trace_id: str) -> bool:
         return trace_id in self.traces
+
+    @property
+    def store_id(self) -> int:
+        return self._store_id
 
     def traces_for_neuron(self, neuron_id: int) -> set[str]:
         """Which traces contain this neuron?"""
@@ -141,18 +183,13 @@ class TraceStore:
 
         Returns: [(trace_id, match_score)] sorted by score descending.
         """
-        candidates = self.candidate_traces(active_neurons)
-        results = []
-        for tid, active_count in candidates.items():
-            trace = self.traces[tid]
-            total = trace.total_neurons()
-            if total == 0:
-                continue
-            score = active_count / total
-            if score >= threshold:
-                results.append((tid, score))
-        results.sort(key=lambda x: x[1], reverse=True)
-        return results
+        if not active_neurons:
+            return []
+        return brain_core.trace_index_matching_traces(
+            self._store_id,
+            active_neurons,
+            threshold,
+        )
 
     def save(self, path: str) -> None:
         """Save all traces to a JSON file."""
@@ -165,8 +202,7 @@ class TraceStore:
         """Load traces from a JSON file, replacing current store."""
         with open(path) as f:
             data = json.load(f)
-        self.traces.clear()
-        self._neuron_to_traces.clear()
+        self.clear()
         for d in data:
             self.add(Trace.from_dict(d))
 

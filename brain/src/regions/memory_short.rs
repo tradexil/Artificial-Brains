@@ -65,7 +65,7 @@ pub fn suppress_non_trace_neurons(
 pub fn active_neuron_count(regions: &[Region], min_activation: f32) -> u32 {
     for region in regions {
         if region.id == RegionId::MemoryShort {
-            return region.active_global_ids(min_activation).len() as u32;
+            return region.active_count(min_activation);
         }
     }
     0

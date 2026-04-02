@@ -17,7 +17,7 @@ use crate::core::region::{Region, RegionId};
 pub fn compute_threat_drive(regions: &[Region]) -> f32 {
     for region in regions {
         if region.id == RegionId::Emotion {
-            let active = region.active_global_ids(0.5).len() as f32;
+            let active = region.active_count(0.5) as f32;
             let rate = active / region.neurons.count.max(1) as f32;
             // Scale: emotion firing rate > 5% → escalating threat
             return (rate * 10.0).min(1.0);
@@ -33,7 +33,7 @@ pub fn compute_threat_drive(regions: &[Region]) -> f32 {
 pub fn compute_relevance_drive(regions: &[Region]) -> f32 {
     for region in regions {
         if region.id == RegionId::Executive {
-            let active = region.active_global_ids(0.5).len() as f32;
+            let active = region.active_count(0.5) as f32;
             let rate = active / region.neurons.count.max(1) as f32;
             return (rate * 10.0).min(1.0);
         }

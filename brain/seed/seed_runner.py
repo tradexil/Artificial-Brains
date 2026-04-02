@@ -53,18 +53,19 @@ def seed_brain(
     rng_traces = random.Random(seed + 1)
 
     t0 = time.time()
+    locality_chunks = max(1, brain_core.get_num_threads())
 
     # --- Step 1: Spawn within-region synapses ---
     if verbose:
-        print("Step 1: Generating within-region synapses...")
-    within_synapses = spawn_within_region_synapses(rng=rng_synapses)
+        print(f"Step 1: Generating within-region synapses (chunk-aware, {locality_chunks} chunks)...")
+    within_synapses = spawn_within_region_synapses(rng=rng_synapses, chunk_count=locality_chunks)
     if verbose:
         print(f"  Within-region synapses: {len(within_synapses):,}")
 
     # --- Step 2: Spawn traces ---
     if verbose:
-        print("Step 2: Generating traces...")
-    trace_store = spawn_traces(rng=rng_traces)
+        print(f"Step 2: Generating traces (chunk-aware, {locality_chunks} chunks)...")
+    trace_store = spawn_traces(rng=rng_traces, chunk_count=locality_chunks)
     if verbose:
         trace_report(trace_store)
 
@@ -97,6 +98,7 @@ def seed_brain(
         traces_neurons=traces_neurons,
         flow_connections=SIGNAL_FLOW_CONNECTIONS,
         rng=rng_synapses,
+        chunk_count=locality_chunks,
     )
     if verbose:
         print(f"  Cross-region synapses: {len(cross_synapses):,}")
@@ -169,16 +171,17 @@ def seed_brain_fast(
     rng_traces = random.Random(seed + 1)
 
     t0 = time.time()
+    locality_chunks = max(1, brain_core.get_num_threads())
 
     # Within-region synapses (same as full)
     if verbose:
-        print("Fast seed: within-region synapses...")
-    within_synapses = spawn_within_region_synapses(rng=rng_synapses)
+        print(f"Fast seed: within-region synapses (chunk-aware, {locality_chunks} chunks)...")
+    within_synapses = spawn_within_region_synapses(rng=rng_synapses, chunk_count=locality_chunks)
 
     # Fewer traces
     if verbose:
-        print(f"Fast seed: {n_traces} traces...")
-    trace_store = spawn_traces(count=n_traces, rng=rng_traces)
+        print(f"Fast seed: {n_traces} traces (chunk-aware, {locality_chunks} chunks)...")
+    trace_store = spawn_traces(count=n_traces, rng=rng_traces, chunk_count=locality_chunks)
 
     # Physics + relational + number traces (small, always include)
     spawn_physics_traces(trace_store, rng=random.Random(seed + 10))
@@ -193,6 +196,7 @@ def seed_brain_fast(
         traces_neurons=traces_neurons,
         flow_connections=SIGNAL_FLOW_CONNECTIONS,
         rng=rng_synapses,
+        chunk_count=locality_chunks,
     )
 
     all_synapses = within_synapses + cross_synapses

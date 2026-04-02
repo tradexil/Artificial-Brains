@@ -22,9 +22,7 @@ const INPUT_REGIONS: [RegionId; 6] = [
 pub fn count_active_input_regions(regions: &[Region], min_activation: f32) -> u32 {
     let mut count = 0;
     for region in regions {
-        if INPUT_REGIONS.contains(&region.id)
-            && !region.active_global_ids(min_activation).is_empty()
-        {
+        if INPUT_REGIONS.contains(&region.id) && region.active_count(min_activation) > 0 {
             count += 1;
         }
     }

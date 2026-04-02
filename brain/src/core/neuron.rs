@@ -3,6 +3,8 @@
 /// Each neuron accumulates potential from incoming synapses,
 /// leaks toward zero each tick, and fires when threshold is exceeded.
 
+const DEFAULT_ACTIVE_THRESHOLD: f32 = 0.5;
+
 /// Excitatory neurons produce positive-weight synapses only.
 /// Inhibitory neurons produce negative-weight synapses only (Dale's Law).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,46 +70,50 @@ impl NeuronStorage {
     pub fn swap_activation_buffers(&mut self) {
         std::mem::swap(&mut self.activations, &mut self.prev_activations);
         // Clear current activations — they'll be recomputed this tick
-        for a in self.activations.iter_mut() {
-            *a = 0.0;
-        }
+        self.activations.fill(0.0);
     }
 
     /// Apply the LIF update to all neurons in this region.
     /// `incoming` is a slice of accumulated input for each neuron
     /// (already multiplied by synapse weights and attention gain).
     /// Length must equal self.count.
-    pub fn update(&mut self, incoming: &[f32]) {
+    pub fn update(&mut self, incoming: &[f32]) -> u32 {
         debug_assert_eq!(incoming.len(), self.count as usize);
 
         let threshold = self.params.threshold;
         let leak = self.params.leak_rate;
         let refr_period = self.params.refractory_period;
 
+        let mut active_count = 0u32;
         for i in 0..self.count as usize {
             // Refractory period — can't fire, activation decays
             if self.refractory[i] > 0 {
                 self.refractory[i] -= 1;
                 self.activations[i] = self.prev_activations[i] * 0.5;
-                continue;
+            } else {
+                // Accumulate incoming signal
+                self.potentials[i] += incoming[i];
+
+                // Leak toward zero
+                self.potentials[i] *= leak;
+
+                // Fire if above threshold
+                if self.potentials[i] >= threshold {
+                    self.activations[i] = 1.0;
+                    self.potentials[i] = 0.0; // reset
+                    self.refractory[i] = refr_period;
+                } else {
+                    // Decay activation if didn't fire
+                    self.activations[i] = self.prev_activations[i] * 0.8;
+                }
             }
 
-            // Accumulate incoming signal
-            self.potentials[i] += incoming[i];
-
-            // Leak toward zero
-            self.potentials[i] *= leak;
-
-            // Fire if above threshold
-            if self.potentials[i] >= threshold {
-                self.activations[i] = 1.0;
-                self.potentials[i] = 0.0; // reset
-                self.refractory[i] = refr_period;
-            } else {
-                // Decay activation if didn't fire
-                self.activations[i] = self.prev_activations[i] * 0.8;
+            if self.activations[i] > DEFAULT_ACTIVE_THRESHOLD {
+                active_count += 1;
             }
         }
+
+        active_count
     }
 
     /// Inject external activation into specific neurons (for input regions).
@@ -129,6 +135,14 @@ impl NeuronStorage {
             .filter(|(_, &a)| a > min_activation)
             .map(|(i, _)| i as u32)
             .collect()
+    }
+
+    /// Count neurons with activation > min_activation without allocating.
+    pub fn count_active(&self, min_activation: f32) -> u32 {
+        self.activations
+            .iter()
+            .filter(|&&activation| activation > min_activation)
+            .count() as u32
     }
 
     /// Reset all dynamics to zero (for testing / reinitialization).
@@ -244,5 +258,18 @@ mod tests {
         assert!(active.contains(&2));
         assert!(active.contains(&7));
         assert_eq!(active.len(), 2);
+    }
+
+    #[test]
+    fn test_update_returns_active_count() {
+        let mut storage = NeuronStorage::new(10, default_params(), 0.0);
+        let mut incoming = vec![0.0; 10];
+        incoming[1] = 0.6;
+        incoming[4] = 0.8;
+
+        let active_count = storage.update(&incoming);
+
+        assert_eq!(active_count, 2);
+        assert_eq!(storage.count_active(0.5), 2);
     }
 }

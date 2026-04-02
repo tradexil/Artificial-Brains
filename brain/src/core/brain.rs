@@ -3,15 +3,15 @@
 /// and orchestrates the tick cycle.
 
 use crate::core::attention::AttentionSystem;
+use crate::core::activity::ActivityCache;
 use crate::core::binding::{BindingStore, PatternRef};
 use crate::core::homeostasis::HomeostasisSystem;
 use crate::core::neuromodulator::NeuromodulatorSystem;
 use crate::core::propagate::DelayBuffer;
 use crate::core::region::{Region, RegionId};
-use crate::core::sleep::{SleepCycleManager, SleepState};
+use crate::core::sleep::SleepCycleManager;
 use crate::core::synapse::{SynapseData, SynapsePool};
 use crate::core::tick::{self, TickResult};
-use crate::regions::attention as region_attention;
 use crate::regions::emotion as region_emotion;
 use crate::regions::executive as region_executive;
 use crate::regions::language as region_language;
@@ -33,6 +33,7 @@ pub struct Brain {
     pub neuromodulator: NeuromodulatorSystem,
     pub homeostasis: HomeostasisSystem,
     pub sleep_cycle: SleepCycleManager,
+    pub activity_cache: ActivityCache,
     pub tick_count: u64,
 }
 
@@ -51,6 +52,7 @@ impl Brain {
             neuromodulator: NeuromodulatorSystem::new(),
             homeostasis: HomeostasisSystem::new(),
             sleep_cycle: SleepCycleManager::new(),
+            activity_cache: ActivityCache::new(),
             tick_count: 0,
         }
     }
@@ -69,6 +71,7 @@ impl Brain {
             neuromodulator: NeuromodulatorSystem::new(),
             homeostasis: HomeostasisSystem::new(),
             sleep_cycle: SleepCycleManager::new(),
+            activity_cache: ActivityCache::new(),
             tick_count: 0,
         }
     }
@@ -109,15 +112,15 @@ impl Brain {
         }
 
         // Phase 4: auto-compute threat and relevance drives from brain activity
-        let threat = region_attention::compute_threat_drive(&self.regions);
-        let relevance = region_attention::compute_relevance_drive(&self.regions);
+        let threat = (self.activity_cache.active_rate(RegionId::Emotion) * 10.0).min(1.0);
+        let relevance = (self.activity_cache.active_rate(RegionId::Executive) * 10.0).min(1.0);
         for &rid in RegionId::ALL.iter() {
             let (existing_novelty, _, _) = self.attention_system.drives_for(rid);
             self.attention_system.set_drives(rid, existing_novelty, threat, relevance);
         }
 
         // Phase 6: compute emotion state and update neuromodulators
-        let emotion_arousal = region_emotion::compute_arousal(&self.regions, 0.01);
+        let emotion_arousal = (self.activity_cache.active_rate(RegionId::Emotion) / 0.10).min(1.0);
         let emotion_polarity = region_emotion::compute_polarity(&self.regions, 0.01);
         self.neuromodulator.update_arousal_from_emotion(emotion_arousal);
         self.neuromodulator.update_valence_from_emotion(emotion_polarity);
@@ -143,6 +146,7 @@ impl Brain {
             self.attention_system.gains(),
             self.tick_count,
         );
+        self.activity_cache.update_from_tick_result(&result, &self.regions);
 
         // Phase 6: deplete energy based on activity (modulated by circadian)
         let circadian_mod = self.homeostasis.circadian_energy_modifier();
@@ -153,16 +157,26 @@ impl Brain {
         let conflict = region_executive::detect_motor_conflict(&self.regions, 0.01);
         if conflict > 0.3 {
             region_executive::resolve_motor_conflict(&mut self.regions, 0.01, 0.5);
+            if let Some(region) = self.region(RegionId::Motor) {
+                let active_count = region.active_count(0.5);
+                self.activity_cache
+                    .refresh_region_count(RegionId::Motor, region.neurons.count, active_count);
+            }
         }
 
         // Phase 6: impulse suppression — executive blocks emotion→motor impulse
         let impulses = region_emotion::emotion_motor_impulse(&self.regions, 0.01);
         if !impulses.is_empty() {
             region_executive::inhibit_motor_neurons(&mut self.regions, 0.01, &impulses);
+            if let Some(region) = self.region(RegionId::Motor) {
+                let active_count = region.active_count(0.5);
+                self.activity_cache
+                    .refresh_region_count(RegionId::Motor, region.neurons.count, active_count);
+            }
         }
 
         // Compute prediction errors from post-tick activations
-        self.prediction_state.update(&self.regions);
+        self.prediction_state.update_from_cache(&self.activity_cache);
 
         self.tick_count += 1;
         result
@@ -306,12 +320,47 @@ impl Brain {
 
     /// Get firing rate for a region (fraction of neurons active).
     pub fn firing_rate(&self, region_id: RegionId) -> f32 {
-        if let Some(region) = self.region(region_id) {
-            let active = region.active_global_ids(0.5).len() as f32;
-            active / region.neurons.count as f32
-        } else {
-            0.0
-        }
+        self.activity_cache.active_rate(region_id)
+    }
+
+    pub fn active_count(&self, region_id: RegionId) -> u32 {
+        self.activity_cache.active_count(region_id)
+    }
+
+    pub fn cached_emotion_arousal(&self) -> f32 {
+        (self.activity_cache.active_rate(RegionId::Emotion) / 0.10).min(1.0)
+    }
+
+    pub fn cached_executive_engagement(&self) -> f32 {
+        (self.activity_cache.active_rate(RegionId::Executive) / 0.05).min(1.0)
+    }
+
+    pub fn cached_language_activation(&self) -> f32 {
+        (self.activity_cache.active_rate(RegionId::Language) / 0.05).min(1.0)
+    }
+
+    pub fn cached_speech_activity(&self) -> f32 {
+        (self.activity_cache.active_rate(RegionId::Speech) / 0.05).min(1.0)
+    }
+
+    pub fn cached_sensory_activation(&self) -> f32 {
+        (self.activity_cache.active_rate(RegionId::Sensory) / 0.05).min(1.0)
+    }
+
+    pub fn cached_visual_activation(&self) -> f32 {
+        (self.activity_cache.active_rate(RegionId::Visual) / 0.05).min(1.0)
+    }
+
+    pub fn cached_audio_activation(&self) -> f32 {
+        (self.activity_cache.active_rate(RegionId::Audio) / 0.05).min(1.0)
+    }
+
+    pub fn cached_motor_activation(&self) -> f32 {
+        (self.activity_cache.active_rate(RegionId::Motor) / 0.05).min(1.0)
+    }
+
+    pub fn cached_planning_signal(&self) -> f32 {
+        (self.cached_executive_engagement() * self.cached_language_activation()).sqrt()
     }
 
     // === BINDING OPERATIONS ===
@@ -400,7 +449,18 @@ impl Brain {
 
     /// Count active input regions for integration.
     pub fn integration_input_count(&self, min_activation: f32) -> u32 {
-        crate::regions::integration::count_active_input_regions(&self.regions, min_activation)
+        let _ = min_activation;
+        [
+            RegionId::Sensory,
+            RegionId::Visual,
+            RegionId::Audio,
+            RegionId::Pattern,
+            RegionId::Emotion,
+            RegionId::Language,
+        ]
+        .into_iter()
+        .filter(|&region_id| self.activity_cache.active_count(region_id) > 0)
+        .count() as u32
     }
 
     /// Boost integration region based on multi-modal convergence.
@@ -434,7 +494,11 @@ impl Brain {
 
     /// Get emotion arousal from current region state.
     pub fn emotion_arousal(&self) -> f32 {
-        region_emotion::compute_arousal(&self.regions, 0.01)
+        let active = self
+            .region(RegionId::Emotion)
+            .map(|region| region.active_count(0.01) as f32)
+            .unwrap_or(0.0);
+        (active / (RegionId::Emotion.neuron_count() as f32 * 0.10)).min(1.0)
     }
 
     /// Get emotion urgency.
@@ -469,7 +533,9 @@ impl Brain {
 
     /// Get planning signal (executive×language engagement).
     pub fn planning_signal(&self) -> f32 {
-        region_executive::planning_signal(&self.regions, 0.01)
+        let exec = self.executive_engagement();
+        let lang = self.language_activation();
+        (exec * lang).sqrt()
     }
 
     /// Recover energy (e.g. during consolidation/rest).
@@ -660,6 +726,7 @@ impl Brain {
         self.neuromodulator.reset();
         self.homeostasis.reset();
         self.sleep_cycle.reset();
+        self.activity_cache = ActivityCache::new();
         self.tick_count = 0;
     }
 

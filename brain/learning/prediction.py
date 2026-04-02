@@ -121,20 +121,29 @@ class PredictionEngine:
         return predicted
 
     def compute_errors(
-        self, snapshot: ActivationSnapshot
+        self, snapshot_or_counts: ActivationSnapshot | dict[str, int]
     ) -> dict[str, float]:
         """Compute prediction error per region.
 
         Args:
-            snapshot: actual activation after tick
+            snapshot_or_counts: actual activation after tick, either as a full
+            snapshot or as precomputed per-region active counts.
 
         Returns:
             Dict of region_name → error (0.0–1.0)
         """
         errors: dict[str, float] = {}
 
+        if isinstance(snapshot_or_counts, ActivationSnapshot):
+            actual_counts = snapshot_or_counts.region_active_counts or {
+                region: len(snapshot_or_counts.active_neurons.get(region, []))
+                for region in all_region_names()
+            }
+        else:
+            actual_counts = snapshot_or_counts
+
         for region in all_region_names():
-            actual_count = len(snapshot.active_neurons.get(region, []))
+            actual_count = actual_counts.get(region, 0)
             size = region_size(region)
             actual_rate = actual_count / size if size > 0 else 0.0
 

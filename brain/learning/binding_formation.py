@@ -11,7 +11,7 @@ E.g., "red" (visual) + "ball" (pattern) → one object.
 
 from __future__ import annotations
 
-from collections import defaultdict
+import itertools
 
 import brain_core
 
@@ -26,12 +26,21 @@ from brain.utils.config import (
 )
 
 
+_BINDING_TRACKER_ID_COUNTER = itertools.count(1)
+
+
 class CoActivationTracker:
     """Tracks cross-region pattern co-activations within a temporal window."""
 
     def __init__(self):
-        # (trace_id_a, region_a, trace_id_b, region_b) → list of tick deltas
-        self._co_activations: dict[tuple[str, str, str, str], list[int]] = defaultdict(list)
+        self._tracker_id = next(_BINDING_TRACKER_ID_COUNTER)
+        brain_core.binding_tracker_create(self._tracker_id)
+
+    def __del__(self):
+        try:
+            brain_core.binding_tracker_drop(self._tracker_id)
+        except Exception:
+            pass
 
     def record(
         self,
@@ -48,59 +57,31 @@ class CoActivationTracker:
         if len(active_traces) < 2:
             return []
 
-        # Get currently active traces and their primary regions
-        trace_regions: list[tuple[str, str, list[int]]] = []
+        # Keep Python-side primary-region lookup, but batch the pairwise tracking in Rust.
+        active_patterns: list[tuple[str, str]] = []
         for tid, score in active_traces:
             trace = trace_store.get(tid)
             if trace is None:
                 continue
-            # Find primary region (most neurons)
             best_region = max(
                 trace.neurons.items(),
                 key=lambda x: len(x[1]),
                 default=(None, []),
             )
             if best_region[0] is not None and best_region[1]:
-                trace_regions.append((tid, best_region[0], best_region[1]))
+                active_patterns.append((tid, best_region[0]))
 
-        # Record all cross-region pairs
-        ready = []
-        for i, (tid_a, region_a, _) in enumerate(trace_regions):
-            for tid_b, region_b, _ in trace_regions[i + 1:]:
-                if region_a == region_b:
-                    continue  # Same region — not a cross-region binding
-
-                # Canonical key (sorted to avoid duplicates)
-                if (tid_a, region_a) > (tid_b, region_b):
-                    key = (tid_b, region_b, tid_a, region_a)
-                else:
-                    key = (tid_a, region_a, tid_b, region_b)
-
-                self._co_activations[key].append(tick)
-
-                # Check if formation threshold reached
-                activations = self._co_activations[key]
-                if len(activations) >= BINDING_FORMATION_COUNT:
-                    # Check temporal window: are they within ±WINDOW ticks of each other?
-                    recent = activations[-BINDING_FORMATION_COUNT:]
-                    if max(recent) - min(recent) <= BINDING_TEMPORAL_WINDOW * BINDING_FORMATION_COUNT:
-                        avg_delta = 0.0  # simultaneous by default
-                        ready.append((*key, avg_delta))
-                        # Reset counter after formation
-                        del self._co_activations[key]
-
-        return ready
+        return brain_core.binding_tracker_record(
+            self._tracker_id,
+            active_patterns,
+            tick,
+            BINDING_FORMATION_COUNT,
+            BINDING_TEMPORAL_WINDOW,
+        )
 
     def cleanup(self, current_tick: int, max_age: int = 10000) -> None:
         """Remove old co-activation records."""
-        stale = []
-        for key, ticks in self._co_activations.items():
-            # Remove entries older than max_age
-            self._co_activations[key] = [t for t in ticks if current_tick - t < max_age]
-            if not self._co_activations[key]:
-                stale.append(key)
-        for key in stale:
-            del self._co_activations[key]
+        brain_core.binding_tracker_cleanup(self._tracker_id, current_tick, max_age)
 
 
 class BindingFormationEngine:

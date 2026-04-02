@@ -69,7 +69,7 @@ pub fn compute_arousal(regions: &[Region], min_activation: f32) -> f32 {
         None => return 0.0,
     };
 
-    let active_count = region.active_global_ids(min_activation).len() as f32;
+    let active_count = region.active_count(min_activation) as f32;
     // Scale: 10% firing = high arousal
     let rate = active_count / (EMOTION_COUNT as f32 * 0.10);
     rate.min(1.0)

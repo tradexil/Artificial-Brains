@@ -86,7 +86,7 @@ pub fn sensory_activation_strength(regions: &[Region], min_activation: f32) -> f
         None => return 0.0,
     };
 
-    let active = regions[idx].active_global_ids(min_activation).len() as f32;
+    let active = regions[idx].active_count(min_activation) as f32;
     (active / (SENSORY_COUNT as f32 * 0.05)).min(1.0)
 }
 

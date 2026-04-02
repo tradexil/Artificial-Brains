@@ -38,9 +38,13 @@ class ActivationSnapshot:
     # region_name → list of (global_neuron_id, activation_value)
     active_neurons: dict[str, list[tuple[int, float]]] = field(default_factory=dict)
     total_active: int = 0
+    active_ids: list[int] = field(default_factory=list)
+    region_active_counts: dict[str, int] = field(default_factory=dict)
 
     def all_active_ids(self) -> list[int]:
         """Flat list of all active neuron IDs across regions."""
+        if self.active_ids:
+            return list(self.active_ids)
         ids = []
         for neurons in self.active_neurons.values():
             ids.extend(nid for nid, _ in neurons)
@@ -48,6 +52,8 @@ class ActivationSnapshot:
 
     def active_set(self) -> set[int]:
         """Set of all active neuron IDs (for O(1) membership check)."""
+        if self.active_ids:
+            return set(self.active_ids)
         s = set()
         for neurons in self.active_neurons.values():
             for nid, _ in neurons:
@@ -102,6 +108,36 @@ class ActivationHistory:
                         result[nid] = act
         return result
 
+    def push_snapshot(
+        self,
+        tick: int,
+        active_neurons: dict[str, list[tuple[int, float]]],
+        total_active: int | None = None,
+        region_active_counts: dict[str, int] | None = None,
+    ) -> ActivationSnapshot:
+        """Create a snapshot from already-collected activation data and store it."""
+        active_ids: list[int] = []
+        counts = dict(region_active_counts or {})
+        computed_total = 0
+
+        for region_name, neurons in active_neurons.items():
+            if not neurons:
+                continue
+            if region_name not in counts:
+                counts[region_name] = len(neurons)
+            active_ids.extend(nid for nid, _ in neurons)
+            computed_total += len(neurons)
+
+        snap = ActivationSnapshot(
+            tick=tick,
+            active_neurons=active_neurons,
+            total_active=total_active if total_active is not None else computed_total,
+            active_ids=active_ids,
+            region_active_counts=counts,
+        )
+        self.push(snap)
+        return snap
+
     def take_snapshot(self, brain_core) -> ActivationSnapshot:
         """Take a snapshot from the Rust brain and push to history.
 
@@ -113,11 +149,4 @@ class ActivationHistory:
         """
         tick_num = brain_core.get_tick_count()
         all_acts = brain_core.get_all_activations(0.01)
-        total = sum(len(v) for v in all_acts.values())
-        snap = ActivationSnapshot(
-            tick=tick_num,
-            active_neurons=all_acts,
-            total_active=total,
-        )
-        self.push(snap)
-        return snap
+        return self.push_snapshot(tick_num, all_acts)

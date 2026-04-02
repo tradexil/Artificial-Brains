@@ -11,6 +11,7 @@
 ///   error < 0.1  → EXPECTED    (attention drops, minimal learning)
 
 use crate::core::region::{Region, RegionId};
+use crate::core::activity::ActivityCache;
 use std::collections::HashMap;
 
 /// Error classification thresholds (mirror config.py values).
@@ -86,7 +87,7 @@ impl PredictionState {
         self.tick_count += 1;
 
         for region in regions {
-            let active = region.active_global_ids(0.5).len() as f32;
+            let active = region.active_count(0.5) as f32;
             let actual_rate = active / region.neurons.count.max(1) as f32;
 
             let predicted = *self.predicted_rates.get(&region.id).unwrap_or(&0.0);
@@ -99,6 +100,25 @@ impl PredictionState {
             // Update EMA
             let new_predicted = self.alpha * actual_rate + (1.0 - self.alpha) * predicted;
             self.predicted_rates.insert(region.id, new_predicted);
+        }
+
+        self.last_errors = errors.clone();
+        errors
+    }
+
+    /// Update predictions from cached per-region activity rates.
+    pub fn update_from_cache(&mut self, cache: &ActivityCache) -> HashMap<RegionId, f32> {
+        let mut errors = HashMap::new();
+        self.tick_count += 1;
+
+        for &region_id in RegionId::ALL.iter() {
+            let actual_rate = cache.active_rate(region_id);
+            let predicted = *self.predicted_rates.get(&region_id).unwrap_or(&0.0);
+            let error = ((actual_rate - predicted).abs() * 20.0).min(1.0);
+            errors.insert(region_id, error);
+
+            let new_predicted = self.alpha * actual_rate + (1.0 - self.alpha) * predicted;
+            self.predicted_rates.insert(region_id, new_predicted);
         }
 
         self.last_errors = errors.clone();

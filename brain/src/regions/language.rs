@@ -31,7 +31,7 @@ pub fn language_activation_strength(regions: &[Region], min_activation: f32) -> 
         None => return 0.0,
     };
 
-    let active = region.active_global_ids(min_activation).len() as f32;
+    let active = region.active_count(min_activation) as f32;
     // Scale: 5% firing = strong activation
     (active / (LANG_COUNT as f32 * 0.05)).min(1.0)
 }
@@ -73,7 +73,7 @@ pub fn inner_monologue_signal(regions: &[Region], min_activation: f32) -> f32 {
     let exec_idx = regions.iter().position(|r| r.id == RegionId::Executive);
     let exec_strength = match exec_idx {
         Some(i) => {
-            let active = regions[i].active_global_ids(min_activation).len() as f32;
+            let active = regions[i].active_count(min_activation) as f32;
             (active / (regions[i].neurons.count as f32 * 0.05)).min(1.0)
         }
         None => 0.0,

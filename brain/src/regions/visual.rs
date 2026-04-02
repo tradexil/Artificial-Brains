@@ -52,7 +52,7 @@ pub fn visual_activation_strength(regions: &[Region], min_activation: f32) -> f3
         None => return 0.0,
     };
 
-    let active = regions[idx].active_global_ids(min_activation).len() as f32;
+    let active = regions[idx].active_count(min_activation) as f32;
     (active / (VISUAL_COUNT as f32 * 0.05)).min(1.0)
 }
 

@@ -43,6 +43,25 @@ impl RegionId {
         RegionId::Numbers,
     ];
 
+    pub const fn index(self) -> usize {
+        match self {
+            RegionId::Sensory => 0,
+            RegionId::Visual => 1,
+            RegionId::Audio => 2,
+            RegionId::MemoryShort => 3,
+            RegionId::MemoryLong => 4,
+            RegionId::Emotion => 5,
+            RegionId::Attention => 6,
+            RegionId::Pattern => 7,
+            RegionId::Integration => 8,
+            RegionId::Language => 9,
+            RegionId::Executive => 10,
+            RegionId::Motor => 11,
+            RegionId::Speech => 12,
+            RegionId::Numbers => 13,
+        }
+    }
+
     /// Return (start, end) global neuron IDs for this region (inclusive).
     pub fn neuron_range(self) -> (u32, u32) {
         match self {
@@ -215,8 +234,13 @@ impl Region {
     }
 
     /// Update all neurons using accumulated incoming signals.
-    pub fn update_neurons(&mut self) {
-        self.neurons.update(&self.incoming);
+    pub fn update_neurons(&mut self) -> u32 {
+        self.neurons.update(&self.incoming)
+    }
+
+    /// Count active neurons without allocating a global-ID vector.
+    pub fn active_count(&self, min_activation: f32) -> u32 {
+        self.neurons.count_active(min_activation)
     }
 
     /// Get list of currently active neurons as global IDs.
@@ -270,9 +294,27 @@ mod tests {
     }
 
     #[test]
+    fn test_region_active_count() {
+        let mut region = Region::new(RegionId::Sensory);
+        region.add_incoming_global(0, 0.6);
+        region.add_incoming_global(1, 0.7);
+        let active = region.update_neurons();
+
+        assert_eq!(active, 2);
+        assert_eq!(region.active_count(0.5), 2);
+    }
+
+    #[test]
     fn test_region_from_name_roundtrip() {
         for id in RegionId::ALL {
             assert_eq!(RegionId::from_name(id.name()), Some(id));
+        }
+    }
+
+    #[test]
+    fn test_region_index_matches_canonical_order() {
+        for (idx, id) in RegionId::ALL.iter().copied().enumerate() {
+            assert_eq!(id.index(), idx);
         }
     }
 }
