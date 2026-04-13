@@ -5,9 +5,12 @@ Used by seed scripts and learning modules that need region info without
 calling into Rust.
 """
 
+from functools import lru_cache
+
 from brain.utils.config import REGIONS, REGION_CONFIG
 
 
+@lru_cache(maxsize=None)
 def region_for_neuron(global_id: int) -> str | None:
     """Return region name for a global neuron ID, or None if out of range."""
     for name, (start, end) in REGIONS.items():

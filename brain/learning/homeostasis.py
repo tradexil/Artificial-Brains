@@ -159,6 +159,8 @@ class HomeostasisManager:
         self._consolidation_done_this_sleep = False
         self._sleep_session = SleepSessionStats(energy_start=energy)
 
+        self.trace_store.sync_runtime_state(self._recent_trace_ids)
+
         # Build dream queue: sort by emotional importance + novelty
         candidates: list[Trace] = []
         for tid in self._recent_trace_ids:
@@ -226,6 +228,7 @@ class HomeostasisManager:
 
             # Slight strength boost from dream replay
             trace.strength = min(1.0, trace.strength + 0.005)
+            self.trace_store.sync_trace(trace.id)
 
         self._sleep_session.traces_replayed += stats.traces_replayed
         return stats

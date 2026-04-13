@@ -4,7 +4,8 @@
 /// unified experiences. It fires when multiple regions are co-active,
 /// with strength proportional to the number of active regions.
 ///
-/// Temporal binding window: patterns within ±5 ticks are bound together.
+/// Temporal binding horizon is enforced by the binding tracker and is based on
+/// the configured repeat window rather than a hardcoded ±5 ticks.
 
 use crate::core::region::{Region, RegionId};
 

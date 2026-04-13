@@ -209,6 +209,20 @@ class AudioInput:
         """Encode a single frequency into neuron activations (without injecting)."""
         return brain_core.frequency_to_neurons(freq_hz, self.spread)
 
+    def checkpoint_state(self) -> dict:
+        return {
+            "boost": float(self.boost),
+            "spread": int(self.spread),
+            "prev_energy": float(self._prev_energy),
+            "onset_history": [float(value) for value in self._onset_history],
+        }
+
+    def restore_checkpoint_state(self, state: dict) -> None:
+        self.boost = float(state.get("boost", self.boost))
+        self.spread = int(state.get("spread", self.spread))
+        self._prev_energy = float(state.get("prev_energy", 0.0))
+        self._onset_history = [float(value) for value in list(state.get("onset_history", []))]
+
     def reset(self) -> None:
         """Reset internal state (onset history, energy tracking)."""
         self._prev_energy = 0.0

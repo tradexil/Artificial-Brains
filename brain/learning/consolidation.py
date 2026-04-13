@@ -61,6 +61,8 @@ class ConsolidationEngine:
           2. Novelty (new stuff second)
           3. Strength (frequent stuff third)
         """
+        trace_store.sync_runtime_state(recent_trace_ids)
+
         # Filter to traces that actually exist and were recently active
         candidates: list[Trace] = []
         for tid in recent_trace_ids:
@@ -132,6 +134,7 @@ class ConsolidationEngine:
 
             # Boost trace strength from consolidation
             trace.strength = min(1.0, trace.strength + 0.02)
+            trace_store.sync_trace(trace.id)
 
         return {
             "active": True,

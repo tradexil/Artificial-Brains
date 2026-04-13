@@ -13,7 +13,7 @@ Prediction error effects:
 
 from __future__ import annotations
 
-from collections import defaultdict
+import brain_core
 
 from brain.structures.brain_state import (
     ActivationHistory,
@@ -29,6 +29,17 @@ from brain.utils.config import (
     PREDICTION_SURPRISE_DURATION,
     PREDICTION_ALARM_DURATION,
 )
+
+
+_MODALITY_FAMILY_BY_REGION = {
+    "audio": "audio",
+    "language": "text",
+    "motor": "motor",
+    "numbers": "numbers",
+    "sensory": "sensory",
+    "speech": "text",
+    "visual": "visual",
+}
 
 
 class PredictionEngine:
@@ -68,46 +79,11 @@ class PredictionEngine:
         Returns:
             Dict of region_name → predicted_activation_rate (0.0–1.0)
         """
-        # Accumulate predicted neuron counts per region
-        region_predicted: dict[str, float] = defaultdict(float)
-
-        # Traces that are active contribute prediction for their co-traces
-        seen_traces: set[str] = set()
-        for tid, score in active_traces:
-            seen_traces.add(tid)
-            trace = self.trace_store.get(tid)
-            if trace is None:
-                continue
-
-            # Active trace predicts activation in its own regions
-            for region, neurons in trace.neurons.items():
-                size = region_size(region)
-                if size > 0:
-                    region_predicted[region] += (len(neurons) / size) * score
-
-            # Co-traces predict activation too (weaker signal)
-            for co_id in trace.co_traces:
-                if co_id in seen_traces:
-                    continue
-                co_trace = self.trace_store.get(co_id)
-                if co_trace is None:
-                    continue
-                for region, neurons in co_trace.neurons.items():
-                    size = region_size(region)
-                    if size > 0:
-                        region_predicted[region] += (len(neurons) / size) * score * 0.3
-
-        # Working memory traces also contribute prediction (weaker)
-        for wm_id in working_memory_ids:
-            if wm_id in seen_traces:
-                continue
-            wm_trace = self.trace_store.get(wm_id)
-            if wm_trace is None:
-                continue
-            for region, neurons in wm_trace.neurons.items():
-                size = region_size(region)
-                if size > 0:
-                    region_predicted[region] += (len(neurons) / size) * 0.2
+        region_predicted = brain_core.trace_index_predict_regions(
+            self.trace_store.store_id,
+            active_traces,
+            working_memory_ids,
+        )
 
         # Combine trace-based prediction with EMA baseline
         predicted: dict[str, float] = {}
@@ -162,10 +138,36 @@ class PredictionEngine:
         return errors
 
     def global_error(self, errors: dict[str, float]) -> float:
-        """Mean prediction error across all regions."""
+        """Mean prediction error across active regions.
+
+        Only regions with nonzero error contribute to the average.
+        This prevents inactive regions (e.g. visual/audio during text-only input)
+        from diluting the novelty signal and suppressing trace formation.
+        """
         if not errors:
             return 0.0
-        return sum(errors.values()) / len(errors)
+        active_errors = [e for e in errors.values() if e > 0.0]
+        if not active_errors:
+            return 0.0
+        return sum(active_errors) / len(active_errors)
+
+    def modality_family_errors(self, errors: dict[str, float]) -> dict[str, float]:
+        """Mean prediction error for each modality family with mapped regions."""
+        totals: dict[str, float] = {}
+        counts: dict[str, int] = {}
+
+        for region_name, error in errors.items():
+            family_name = _MODALITY_FAMILY_BY_REGION.get(region_name)
+            if family_name is None:
+                continue
+            totals[family_name] = totals.get(family_name, 0.0) + error
+            counts[family_name] = counts.get(family_name, 0) + 1
+
+        return {
+            family_name: totals[family_name] / counts[family_name]
+            for family_name in totals
+            if counts[family_name] > 0
+        }
 
     def classify(self, error: float) -> str:
         """Classify a prediction error into a category."""

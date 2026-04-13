@@ -9,7 +9,10 @@
 // Arousal lowers firing thresholds. Focus narrows attention.
 // Energy depletes with activity and gates consolidation.
 
+use serde::{Deserialize, Serialize};
+
 /// Global neuromodulator system.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct NeuromodulatorSystem {
     pub arousal: f32,
     pub valence: f32,

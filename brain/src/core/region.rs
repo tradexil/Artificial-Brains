@@ -3,10 +3,11 @@
 /// Each region owns its NeuronStorage and knows its global neuron ID offset.
 /// Local index 0 in visual region = global neuron ID 10,000.
 
-use crate::core::neuron::{NeuronParams, NeuronStorage};
+use crate::core::neuron::{NeuronParams, NeuronStorage, UpdateStats};
+use serde::{Deserialize, Serialize};
 
 /// Region identifiers — maps 1:1 with the 14 regions in PLAN.md.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum RegionId {
     Sensory,
     Visual,
@@ -22,6 +23,49 @@ pub enum RegionId {
     Motor,
     Speech,
     Numbers,
+}
+
+/// Execution lanes for wave-scheduled ticks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum LaneId {
+    Perception,
+    Cognition,
+    Control,
+}
+
+impl LaneId {
+    pub const ALL: [LaneId; 3] = [
+        LaneId::Perception,
+        LaneId::Cognition,
+        LaneId::Control,
+    ];
+
+    pub const fn index(self) -> usize {
+        match self {
+            LaneId::Perception => 0,
+            LaneId::Cognition => 1,
+            LaneId::Control => 2,
+        }
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            LaneId::Perception => "perception",
+            LaneId::Cognition => "cognition",
+            LaneId::Control => "control",
+        }
+    }
+
+    pub const fn cadence_interval(self) -> u64 {
+        match self {
+            LaneId::Perception => 1,
+            LaneId::Cognition | LaneId::Control => 2,
+        }
+    }
+
+    pub const fn is_scheduled_on(self, tick_number: u64) -> bool {
+        tick_number % self.cadence_interval() == 0
+    }
 }
 
 impl RegionId {
@@ -60,6 +104,36 @@ impl RegionId {
             RegionId::Speech => 12,
             RegionId::Numbers => 13,
         }
+    }
+
+    pub const fn lane(self) -> LaneId {
+        match self {
+            RegionId::Sensory
+            | RegionId::Visual
+            | RegionId::Audio
+            | RegionId::Attention
+            | RegionId::Pattern => LaneId::Perception,
+            RegionId::MemoryShort
+            | RegionId::Emotion
+            | RegionId::Integration
+            | RegionId::Language
+            | RegionId::Numbers => LaneId::Cognition,
+            RegionId::MemoryLong
+            | RegionId::Executive
+            | RegionId::Motor
+            | RegionId::Speech => LaneId::Control,
+        }
+    }
+
+    pub const fn cadence_interval(self) -> u64 {
+        match self {
+            RegionId::MemoryLong => 4,
+            _ => self.lane().cadence_interval(),
+        }
+    }
+
+    pub const fn is_scheduled_on(self, tick_number: u64) -> bool {
+        tick_number % self.cadence_interval() == 0
     }
 
     /// Return (start, end) global neuron IDs for this region (inclusive).
@@ -101,7 +175,7 @@ impl RegionId {
             RegionId::Pattern     => NeuronParams { threshold: 0.50, leak_rate: 0.90, refractory_period: 4 },
             RegionId::Integration => NeuronParams { threshold: 0.55, leak_rate: 0.92, refractory_period: 5 },
             RegionId::Language    => NeuronParams { threshold: 0.50, leak_rate: 0.94, refractory_period: 4 },
-            RegionId::Executive   => NeuronParams { threshold: 0.60, leak_rate: 0.93, refractory_period: 6 },
+            RegionId::Executive   => NeuronParams { threshold: 0.50, leak_rate: 0.93, refractory_period: 6 },
             RegionId::Motor       => NeuronParams { threshold: 0.55, leak_rate: 0.85, refractory_period: 3 },
             RegionId::Speech      => NeuronParams { threshold: 0.50, leak_rate: 0.87, refractory_period: 3 },
             RegionId::Numbers     => NeuronParams { threshold: 0.50, leak_rate: 0.96, refractory_period: 4 },
@@ -168,9 +242,20 @@ impl RegionId {
             _              => None,
         }
     }
+
+    pub fn from_neuron_id(global_id: u32) -> Option<RegionId> {
+        RegionId::ALL
+            .iter()
+            .find(|region_id| {
+                let (start, end) = region_id.neuron_range();
+                global_id >= start && global_id <= end
+            })
+            .copied()
+    }
 }
 
 /// A Region owns its neurons and knows its position in global neuron space.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Region {
     pub id: RegionId,
     pub neurons: NeuronStorage,
@@ -179,6 +264,10 @@ pub struct Region {
     /// Per-tick incoming signal buffer. Accumulated during propagation,
     /// consumed during neuron update, then zeroed.
     pub incoming: Vec<f32>,
+    pub incoming_immediate_same: Vec<f32>,
+    pub incoming_immediate_cross: Vec<f32>,
+    pub incoming_delayed_same: Vec<f32>,
+    pub incoming_delayed_cross: Vec<f32>,
 }
 
 impl Region {
@@ -193,6 +282,10 @@ impl Region {
             neurons: NeuronStorage::new(count, params, inhibitory_pct),
             global_offset: start,
             incoming: vec![0.0; count as usize],
+            incoming_immediate_same: vec![0.0; count as usize],
+            incoming_immediate_cross: vec![0.0; count as usize],
+            incoming_delayed_same: vec![0.0; count as usize],
+            incoming_delayed_cross: vec![0.0; count as usize],
         }
     }
 
@@ -227,15 +320,51 @@ impl Region {
         }
     }
 
+    #[inline]
+    pub fn add_incoming_classified_local(
+        &mut self,
+        local_idx: u32,
+        value: f32,
+        source_region_idx: usize,
+        delayed: bool,
+    ) {
+        let idx = local_idx as usize;
+        self.incoming[idx] += value;
+        let same_region = self.id.index() == source_region_idx;
+        match (delayed, same_region) {
+            (true, true) => self.incoming_delayed_same[idx] += value,
+            (true, false) => self.incoming_delayed_cross[idx] += value,
+            (false, true) => self.incoming_immediate_same[idx] += value,
+            (false, false) => self.incoming_immediate_cross[idx] += value,
+        }
+    }
+
     /// Prepare for new tick: swap activation buffers.
     pub fn pre_tick(&mut self) {
         self.neurons.swap_activation_buffers();
         self.incoming.fill(0.0);
+        self.incoming_immediate_same.fill(0.0);
+        self.incoming_immediate_cross.fill(0.0);
+        self.incoming_delayed_same.fill(0.0);
+        self.incoming_delayed_cross.fill(0.0);
     }
 
     /// Update all neurons using accumulated incoming signals.
-    pub fn update_neurons(&mut self) -> u32 {
-        self.neurons.update(&self.incoming)
+    pub fn update_neurons(&mut self) -> UpdateStats {
+        self.update_neurons_at(0)
+    }
+
+    pub fn update_neurons_at(&mut self, tick_number: u64) -> UpdateStats {
+        self.neurons.update_with_sources_at(
+            &self.incoming,
+            Some(crate::core::neuron::IncomingSourceSlices {
+                immediate_same: &self.incoming_immediate_same,
+                immediate_cross: &self.incoming_immediate_cross,
+                delayed_same: &self.incoming_delayed_same,
+                delayed_cross: &self.incoming_delayed_cross,
+            }),
+            tick_number,
+        )
     }
 
     /// Count active neurons without allocating a global-ID vector.
@@ -298,9 +427,10 @@ mod tests {
         let mut region = Region::new(RegionId::Sensory);
         region.add_incoming_global(0, 0.6);
         region.add_incoming_global(1, 0.7);
-        let active = region.update_neurons();
+        let stats = region.update_neurons();
 
-        assert_eq!(active, 2);
+        assert_eq!(stats.active_count, 2);
+        assert_eq!(stats.fired_count, 2);
         assert_eq!(region.active_count(0.5), 2);
     }
 

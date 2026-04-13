@@ -119,6 +119,19 @@ class MultimodalInput:
         """Get the last tick a modality was active."""
         return self._last_active.get(modality)
 
+    def checkpoint_state(self) -> dict:
+        return {
+            "last_active": {str(name): int(tick) for name, tick in self._last_active.items()},
+            "audio_encoder": self.audio_encoder.checkpoint_state(),
+        }
+
+    def restore_checkpoint_state(self, state: dict) -> None:
+        self._last_active = {
+            str(name): int(tick)
+            for name, tick in dict(state.get("last_active", {})).items()
+        }
+        self.audio_encoder.restore_checkpoint_state(dict(state.get("audio_encoder", {})))
+
     def reset(self) -> None:
         """Reset all encoders and timing state."""
         self._last_active.clear()

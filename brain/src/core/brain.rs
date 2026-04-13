@@ -4,10 +4,10 @@
 
 use crate::core::attention::AttentionSystem;
 use crate::core::activity::ActivityCache;
-use crate::core::binding::{BindingStore, PatternRef};
+use crate::core::binding::{BindingRecallTraceInput, BindingStore, PatternRef};
 use crate::core::homeostasis::HomeostasisSystem;
 use crate::core::neuromodulator::NeuromodulatorSystem;
-use crate::core::propagate::DelayBuffer;
+use crate::core::propagate::{DelayBuffer, SameRegionDelayAblation};
 use crate::core::region::{Region, RegionId};
 use crate::core::sleep::SleepCycleManager;
 use crate::core::synapse::{SynapseData, SynapsePool};
@@ -21,8 +21,10 @@ use crate::regions::visual as region_visual;
 use crate::regions::audio as region_audio;
 use crate::regions::motor as region_motor;
 use crate::regions::pattern::PredictionState;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+#[derive(Serialize, Deserialize)]
 pub struct Brain {
     pub regions: Vec<Region>,
     pub synapse_pool: SynapsePool,
@@ -34,7 +36,13 @@ pub struct Brain {
     pub homeostasis: HomeostasisSystem,
     pub sleep_cycle: SleepCycleManager,
     pub activity_cache: ActivityCache,
+    pub same_region_delay_ablation: SameRegionDelayAblation,
+    pub same_region_delay_learning_ablation: SameRegionDelayAblation,
     pub tick_count: u64,
+    /// Circular buffer of dense activation snapshots for learning.
+    /// Each entry: dense f32 array of size num_neurons (152k).
+    pub activation_snapshot_cache: Vec<Vec<f32>>,
+    pub activation_snapshot_window: usize,
 }
 
 impl Brain {
@@ -53,7 +61,11 @@ impl Brain {
             homeostasis: HomeostasisSystem::new(),
             sleep_cycle: SleepCycleManager::new(),
             activity_cache: ActivityCache::new(),
+            same_region_delay_ablation: SameRegionDelayAblation::default(),
+            same_region_delay_learning_ablation: SameRegionDelayAblation::default(),
             tick_count: 0,
+            activation_snapshot_cache: Vec::new(),
+            activation_snapshot_window: 3,
         }
     }
 
@@ -72,7 +84,11 @@ impl Brain {
             homeostasis: HomeostasisSystem::new(),
             sleep_cycle: SleepCycleManager::new(),
             activity_cache: ActivityCache::new(),
+            same_region_delay_ablation: SameRegionDelayAblation::default(),
+            same_region_delay_learning_ablation: SameRegionDelayAblation::default(),
             tick_count: 0,
+            activation_snapshot_cache: Vec::new(),
+            activation_snapshot_window: 3,
         }
     }
 
@@ -81,6 +97,49 @@ impl Brain {
     /// Phase 4: Compute drives, update gains, run tick, compute predictions.
     /// Phase 6: Compute emotion state, update neuromodulators, executive conflict.
     /// Phase 9: Homeostatic regulation, sleep cycle update, input gating.
+    /// Store a dense activation snapshot from sparse (id, val) pairs.
+    pub fn push_activation_snapshot(&mut self, ids: &[u32], vals: &[f32]) {
+        let nn = self.synapse_pool.num_neurons() as usize;
+        let mut dense = vec![0.0f32; nn];
+        for (&id, &val) in ids.iter().zip(vals.iter()) {
+            if (id as usize) < nn {
+                dense[id as usize] = val;
+            }
+        }
+        if self.activation_snapshot_cache.len() >= self.activation_snapshot_window {
+            self.activation_snapshot_cache.remove(0);
+        }
+        self.activation_snapshot_cache.push(dense);
+    }
+
+    /// Compute window-active neurons (max across all cached snapshots) as dense array.
+    pub fn compute_window_activity(&self) -> Vec<f32> {
+        let nn = self.synapse_pool.num_neurons() as usize;
+        let mut result = vec![0.0f32; nn];
+        for snapshot in &self.activation_snapshot_cache {
+            for (i, &val) in snapshot.iter().enumerate() {
+                if val > result[i] {
+                    result[i] = val;
+                }
+            }
+        }
+        result
+    }
+
+    /// Get the latest cached snapshot's active neurons as sparse (id, activation) pairs.
+    pub fn latest_snapshot_active(&self) -> Vec<(u32, f32)> {
+        if let Some(snapshot) = self.activation_snapshot_cache.last() {
+            snapshot
+                .iter()
+                .enumerate()
+                .filter(|(_, &val)| val > 0.0)
+                .map(|(i, &val)| (i as u32, val))
+                .collect()
+        } else {
+            Vec::new()
+        }
+    }
+
     pub fn tick(&mut self) -> TickResult {
         // Phase 9: advance circadian clock
         self.homeostasis.advance_circadian();
@@ -144,6 +203,7 @@ impl Brain {
             &self.synapse_pool,
             &mut self.delay_buffer,
             self.attention_system.gains(),
+            &self.same_region_delay_ablation,
             self.tick_count,
         );
         self.activity_cache.update_from_tick_result(&result, &self.regions);
@@ -193,6 +253,27 @@ impl Brain {
                 }
             }
         }
+    }
+
+    pub fn configure_same_region_delay_ablation(&mut self, regions: &[RegionId], delays: &[u8]) {
+        self.same_region_delay_ablation.configure(regions, delays);
+    }
+
+    pub fn clear_same_region_delay_ablation(&mut self) {
+        self.same_region_delay_ablation.clear();
+    }
+
+    pub fn configure_same_region_delay_learning_ablation(
+        &mut self,
+        regions: &[RegionId],
+        delays: &[u8],
+    ) {
+        self.same_region_delay_learning_ablation
+            .configure(regions, delays);
+    }
+
+    pub fn clear_same_region_delay_learning_ablation(&mut self) {
+        self.same_region_delay_learning_ablation.clear();
     }
 
     /// Set attention gain for a specific region (backward compat).
@@ -294,6 +375,21 @@ impl Brain {
         self.synapse_pool.apply_weight_updates();
     }
 
+    pub fn apply_synapse_updates_profiled(&mut self) -> crate::core::synapse::ApplyWeightUpdatesProfile {
+        self.synapse_pool.apply_weight_updates_profiled()
+    }
+
+    pub fn apply_synapse_updates_profiled_bounded(
+        &mut self,
+        max_updates: usize,
+    ) -> crate::core::synapse::ApplyWeightUpdatesProfile {
+        self.synapse_pool.apply_weight_updates_profiled_bounded(max_updates)
+    }
+
+    pub fn pending_synapse_update_count(&self) -> usize {
+        self.synapse_pool.pending_update_count()
+    }
+
     /// Full rebuild of synapse CSR (expensive, do periodically).
     pub fn rebuild_synapses(&mut self) {
         // Build a closure that looks up neuron type by global ID
@@ -390,6 +486,22 @@ impl Brain {
         self.binding_store.find_partial(&active_set)
     }
 
+    /// Evaluate and update binding activity in one pass.
+    pub fn process_bindings(&mut self, min_activation: f32, tick: u64) -> (u32, u32) {
+        let active_set = self.active_neuron_set(min_activation);
+        self.binding_store.process_activity(&active_set, tick)
+    }
+
+    pub fn annotate_binding_traces(
+        &mut self,
+        binding_id: u32,
+        trace_id_a: String,
+        trace_id_b: String,
+    ) {
+        self.binding_store
+            .annotate_traces(binding_id, trace_id_a, trace_id_b);
+    }
+
     /// Strengthen a binding.
     pub fn strengthen_binding(&mut self, binding_id: u32, tick: u64) {
         self.binding_store.strengthen(binding_id, tick);
@@ -415,6 +527,128 @@ impl Brain {
         self.binding_store.get(binding_id).map(|b| {
             (b.weight, b.fires, b.confidence, b.last_fired)
         })
+    }
+
+    /// Get binding pattern activation ratios for the current state.
+    pub fn get_binding_activation(&self, binding_id: u32, min_activation: f32) -> Option<(f32, f32)> {
+        let active_set = self.active_neuron_set(min_activation);
+        self.binding_store.activation_ratios(binding_id, &active_set)
+    }
+
+    /// Get binding pattern activation ratios for multiple bindings in the current state.
+    pub fn get_binding_activations(
+        &self,
+        binding_ids: &[u32],
+        min_activation: f32,
+    ) -> Vec<(u32, f32, f32)> {
+        let active_set = self.active_neuron_set(min_activation);
+        self.binding_store
+            .activation_ratios_for_bindings(binding_ids, &active_set)
+    }
+
+    /// Get pre-injection binding recall candidates for the current state.
+    ///
+    /// Returns (binding_id, relative_weight, source_activation_ratio).
+    pub fn get_binding_recall_candidates(
+        &self,
+        min_activation: f32,
+        min_relative_weight: f32,
+    ) -> Vec<(u32, f32, f32)> {
+        let active_set = self.active_neuron_set(min_activation);
+        self.binding_store
+            .recall_candidates(&active_set, min_relative_weight)
+            .signals
+            .into_iter()
+            .map(|signal| {
+                (
+                    signal.binding_id,
+                    signal.relative_weight,
+                    signal.source_activation_ratio,
+                )
+            })
+            .collect()
+    }
+
+    pub fn get_binding_recall_trace_inputs_from_active(
+        &self,
+        active_neurons: &[u32],
+        min_relative_weight: f32,
+    ) -> Vec<BindingRecallTraceInput> {
+        let active_set = active_neurons.iter().copied().collect();
+        self.binding_store
+            .recall_completion_inputs(&active_set, min_relative_weight)
+    }
+
+    /// Prime partner-side patterns for the next tick based on partially active bindings.
+    ///
+    /// Returns (triggered_bindings, injected_neurons, max_relative_weight, max_boost).
+    pub fn binding_recall(
+        &mut self,
+        min_activation: f32,
+        min_relative_weight: f32,
+        boost_scale: f32,
+    ) -> (u32, u32, [u32; RegionId::ALL.len()], f32, f32) {
+        let active_set = self.active_neuron_set(min_activation);
+        let recall_plan = self
+            .binding_store
+            .recall_candidates(&active_set, min_relative_weight);
+
+        let mut pending_by_region: HashMap<RegionId, HashMap<u32, f32>> = HashMap::new();
+        let mut max_boost = 0.0f32;
+
+        for signal in &recall_plan.signals {
+            let params = signal.target_region.default_params();
+            let required_potential = if params.leak_rate > 0.0 {
+                params.threshold / params.leak_rate
+            } else {
+                params.threshold
+            };
+            let boost = required_potential
+                * (1.0
+                    + boost_scale.max(0.0)
+                        * signal.relative_weight
+                        * signal.source_activation_ratio.clamp(0.0, 1.0));
+            max_boost = max_boost.max(boost);
+
+            let region_pending = pending_by_region.entry(signal.target_region).or_default();
+            for &global_id in &signal.target_neurons {
+                let entry = region_pending.entry(global_id).or_insert(0.0);
+                if boost > *entry {
+                    *entry = boost;
+                }
+            }
+        }
+
+        let injected_neurons = pending_by_region
+            .values()
+            .map(|signals| signals.len() as u32)
+            .sum();
+        let mut region_neuron_counts = [0u32; RegionId::ALL.len()];
+        for (region_id, signals) in &pending_by_region {
+            region_neuron_counts[region_id.index()] = signals.len() as u32;
+        }
+
+        for (region_id, pending_signals) in pending_by_region {
+            if let Some(region) = self.region_mut(region_id) {
+                let local_signals: Vec<(u32, f32)> = pending_signals
+                    .into_iter()
+                    .filter_map(|(global_id, boost)| {
+                        region.global_to_local(global_id).map(|local_id| (local_id, boost))
+                    })
+                    .collect();
+                if !local_signals.is_empty() {
+                    region.neurons.inject(&local_signals);
+                }
+            }
+        }
+
+        (
+            recall_plan.triggered_bindings(),
+            injected_neurons,
+            region_neuron_counts,
+            recall_plan.max_relative_weight,
+            max_boost,
+        )
     }
 
     // === MEMORY OPERATIONS ===
@@ -718,6 +952,10 @@ impl Brain {
         for region in &mut self.regions {
             region.neurons.reset();
             region.incoming.fill(0.0);
+            region.incoming_immediate_same.fill(0.0);
+            region.incoming_immediate_cross.fill(0.0);
+            region.incoming_delayed_same.fill(0.0);
+            region.incoming_delayed_cross.fill(0.0);
         }
         self.delay_buffer = DelayBuffer::new();
         self.attention_system = AttentionSystem::new(15, 0.1, 5.0, 0.4, 0.4, 0.2);
@@ -728,6 +966,25 @@ impl Brain {
         self.sleep_cycle.reset();
         self.activity_cache = ActivityCache::new();
         self.tick_count = 0;
+    }
+
+    /// Reset transient runtime state while preserving learned structure.
+    pub fn reset_runtime_state(&mut self) {
+        for region in &mut self.regions {
+            region.neurons.reset();
+            region.incoming.fill(0.0);
+            region.incoming_immediate_same.fill(0.0);
+            region.incoming_immediate_cross.fill(0.0);
+            region.incoming_delayed_same.fill(0.0);
+            region.incoming_delayed_cross.fill(0.0);
+        }
+        self.delay_buffer = DelayBuffer::new();
+        self.attention_system = AttentionSystem::new(15, 0.1, 5.0, 0.4, 0.4, 0.2);
+        self.prediction_state = PredictionState::new(0.05);
+        self.neuromodulator.reset();
+        self.homeostasis.reset();
+        self.sleep_cycle.reset();
+        self.activity_cache = ActivityCache::new();
     }
 
     // === Phase 9: Homeostasis & Sleep ===
@@ -848,7 +1105,10 @@ mod tests {
         brain.inject(&[(0, 0.5)]);
         brain.tick();
 
-        // Tick 1: signal should reach emotion
+        // Tick 1: cognition is off-cadence, so the signal is carried forward.
+        brain.tick();
+
+        // Tick 2: cognition runs again, so the signal should reach emotion.
         brain.tick();
 
         let emotion = brain.region(RegionId::Emotion).unwrap();
@@ -873,6 +1133,7 @@ mod tests {
 
         // Fire sensory → emotion with boosted gain
         brain.inject(&[(0, 0.5)]);
+        brain.tick();
         brain.tick();
         brain.tick();
 
@@ -903,6 +1164,32 @@ mod tests {
     }
 
     #[test]
+    fn test_reset_runtime_state_preserves_bindings_and_tick_count() {
+        let mut brain = Brain::new();
+        brain.create_binding(
+            RegionId::Visual,
+            vec![10_000],
+            0.5,
+            RegionId::Audio,
+            vec![30_000],
+            0.5,
+            0.0,
+        );
+        brain.inject(&[(0, 0.5)]);
+        brain.tick();
+
+        assert_eq!(brain.tick_count, 1);
+        assert_eq!(brain.binding_count(), 1);
+        assert!(!brain.get_all_activations(0.01).is_empty());
+
+        brain.reset_runtime_state();
+
+        assert_eq!(brain.tick_count, 1);
+        assert_eq!(brain.binding_count(), 1);
+        assert!(brain.get_all_activations(0.01).is_empty());
+    }
+
+    #[test]
     fn test_multiple_ticks_stability() {
         let mut brain = Brain::new();
 
@@ -925,5 +1212,37 @@ mod tests {
 
         let rate = brain.firing_rate(RegionId::Sensory);
         assert!(rate < 0.05, "Sparsity violated: {:.1}% active", rate * 100.0);
+    }
+
+    #[test]
+    fn test_binding_recall_primes_partner_pattern() {
+        let mut brain = Brain::new();
+        let binding_id = brain.create_binding(
+            RegionId::Visual,
+            vec![10_000],
+            1.0,
+            RegionId::Audio,
+            vec![30_000],
+            1.0,
+            0.0,
+        );
+
+        brain.inject(&[(10_000, 1.0)]);
+        brain.tick();
+
+        assert_eq!(brain.find_partial_bindings(0.01), vec![binding_id]);
+
+        let (triggered, injected, region_counts, max_relative_weight, max_boost) =
+            brain.binding_recall(0.01, 0.85, 0.25);
+        assert_eq!(triggered, 1);
+        assert_eq!(injected, 1);
+        assert_eq!(region_counts[RegionId::Audio.index()], 1);
+        assert!(max_relative_weight >= 1.0);
+        assert!(max_boost > 0.0);
+        assert!(brain.region(RegionId::Audio).unwrap().neurons.potentials[0] > 0.0);
+
+        brain.tick();
+
+        assert!(brain.region(RegionId::Audio).unwrap().neurons.activations[0] > 0.0);
     }
 }

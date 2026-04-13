@@ -12,6 +12,7 @@
 
 use crate::core::region::{Region, RegionId};
 use crate::core::activity::ActivityCache;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Error classification thresholds (mirror config.py values).
@@ -52,6 +53,7 @@ pub fn classify_error(error: f32) -> ErrorClass {
 }
 
 /// Tracks predicted activation and computes prediction errors per region.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct PredictionState {
     /// EMA of activation rate per region.
     predicted_rates: HashMap<RegionId, f32>,

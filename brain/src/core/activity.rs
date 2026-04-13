@@ -1,7 +1,8 @@
 use crate::core::region::{Region, RegionId};
 use crate::core::tick::TickResult;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActivityCache {
     active_counts: [u32; RegionId::ALL.len()],
     active_rates: [f32; RegionId::ALL.len()],

@@ -10,8 +10,10 @@
 /// simulating the cost of context-switching.
 
 use crate::core::region::RegionId;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+#[derive(Clone, Serialize, Deserialize)]
 pub struct AttentionSystem {
     /// Current gain per region (applied during propagation).
     gains: HashMap<RegionId, f32>,

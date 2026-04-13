@@ -6,10 +6,12 @@ Supports:
   - speech_commands:  1-second spoken word audio clips, 35 classes
   - imdb:             movie reviews, 2 classes (pos/neg)
   - common_voice:     multi-language speech audio
+  - opus_reasoning:   Crownelius/Opus-4.6-Reasoning-2100x-formatted (system/user/assistant)
 """
 
 from __future__ import annotations
 
+import io
 import math
 from typing import Any, Generator
 
@@ -25,6 +27,18 @@ def _ensure_datasets():
         raise ImportError(
             "HuggingFace `datasets` library required.\n"
             "Install: pip install datasets Pillow soundfile"
+        )
+
+
+def _ensure_soundfile():
+    """Import and return soundfile with a helpful error if missing."""
+    try:
+        import soundfile
+        return soundfile
+    except ImportError:
+        raise ImportError(
+            "`soundfile` is required for manual audio decoding.\n"
+            "Install: pip install soundfile"
         )
 
 
@@ -64,6 +78,58 @@ def load_text_dataset(
 
     else:
         raise ValueError(f"Unknown text dataset: {name}")
+
+
+def load_conversation_dataset(
+    name: str = "opus_reasoning",
+    split: str = "train",
+    max_samples: int = 100,
+) -> list[dict[str, Any]]:
+    """Load a conversation dataset with system/user/assistant roles.
+
+    Returns list of dicts with keys: system, user, assistant, text, metadata.
+    The 'text' field concatenates all roles for full-text processing.
+    """
+    ds_lib = _ensure_datasets()
+
+    if name == "opus_reasoning":
+        ds = ds_lib.load_dataset(
+            "Crownelius/Opus-4.6-Reasoning-2100x-formatted",
+            split=f"{split}[:{max_samples}]",
+        )
+        results = []
+        for row in ds:
+            messages = row.get("messages", [])
+            system_text = ""
+            user_text = ""
+            assistant_text = ""
+            for msg in messages:
+                role = msg.get("role", "")
+                content = msg.get("content", "")
+                if role == "system":
+                    system_text = content
+                elif role == "user":
+                    user_text = content
+                elif role == "assistant":
+                    assistant_text = content
+
+            # For the brain, concatenate all content
+            full_text = f"{system_text} {user_text} {assistant_text}".strip()
+            # Truncate very long assistant responses for tractability
+            if len(full_text) > 2000:
+                full_text = full_text[:2000]
+
+            results.append({
+                "system": system_text,
+                "user": user_text,
+                "assistant": assistant_text,
+                "text": full_text,
+                "metadata": row.get("metadata", {}),
+            })
+        return results
+
+    else:
+        raise ValueError(f"Unknown conversation dataset: {name}")
 
 
 def load_image_dataset(
@@ -120,6 +186,30 @@ def load_audio_dataset(
                 "label": row.get("label", -1),
                 "label_name": row.get("label", "unknown") if isinstance(row.get("label"), str) else str(row.get("label", "?")),
             })
+        return results
+
+    elif name == "esc50":
+        soundfile = _ensure_soundfile()
+        ds = ds_lib.load_dataset(
+            "ashraq/esc50",
+            split=f"{split}[:{max_samples}]",
+        )
+        ds = ds.cast_column("audio", ds_lib.Audio(decode=False))
+        results = []
+        for row in ds:
+            audio = row["audio"]
+            audio_bytes = audio.get("bytes") if isinstance(audio, dict) else None
+            if not audio_bytes:
+                continue
+            samples, sample_rate = soundfile.read(io.BytesIO(audio_bytes))
+            results.append(
+                {
+                    "audio": np.array(samples, dtype=np.float32),
+                    "sample_rate": sample_rate,
+                    "label": row.get("target", -1),
+                    "label_name": str(row.get("category", row.get("target", "?"))),
+                }
+            )
         return results
 
     else:

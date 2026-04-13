@@ -7,8 +7,10 @@
 // Transitions are driven by energy, sleep pressure, and time-in-state.
 // During REM, a flag signals Python to perform dream replay (trace re-activation).
 
+use serde::{Deserialize, Serialize};
+
 /// Sleep cycle state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SleepState {
     Awake,
     Drowsy,
@@ -54,6 +56,7 @@ impl SleepState {
 }
 
 /// Sleep cycle manager.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct SleepCycleManager {
     pub state: SleepState,
     /// Ticks spent in current state.

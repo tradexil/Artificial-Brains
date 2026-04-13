@@ -84,6 +84,7 @@ def create_number_traces(store: TraceStore) -> int:
     language token neurons (for the word form).
     """
     lang_start = REGIONS["language"][0]
+    pattern_start, pattern_end = REGIONS["pattern"]
     rng = random.Random(701)
 
     created = 0
@@ -94,6 +95,9 @@ def create_number_traces(store: TraceStore) -> int:
 
         # Language token neurons for the number word
         neurons["language"] = rng.sample(range(lang_start, lang_start + 9000), 3)
+
+        # Pattern support lets number concepts participate in symbolic matching.
+        neurons["pattern"] = rng.sample(range(pattern_start, pattern_end + 1), 3)
 
         # Memory_long for persistent number knowledge
         ml_start, ml_end = REGIONS["memory_long"]

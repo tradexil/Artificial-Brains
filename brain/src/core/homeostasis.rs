@@ -7,7 +7,10 @@
 // This is NOT a separate region — it modifies the NeuromodulatorSystem
 // each tick, pulling modulators back toward equilibrium.
 
+use serde::{Deserialize, Serialize};
+
 /// Homeostatic regulation system.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct HomeostasisSystem {
     // Set-points (baselines)
     pub arousal_baseline: f32,

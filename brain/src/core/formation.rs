@@ -45,6 +45,30 @@ pub struct BindingTrackerRegistry {
     trackers: HashMap<u64, BindingTracker>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct BindingReadyPair {
+    pub trace_id_a: String,
+    pub region_a: String,
+    pub trace_id_b: String,
+    pub region_b: String,
+    pub avg_delta: f32,
+    pub support_count: usize,
+    pub span_ticks: u64,
+    pub first_tick: u64,
+    pub last_tick: u64,
+}
+
+impl BindingReadyPair {
+    fn key(&self) -> (String, String, String, String) {
+        (
+            self.trace_id_a.clone(),
+            self.region_a.clone(),
+            self.trace_id_b.clone(),
+            self.region_b.clone(),
+        )
+    }
+}
+
 impl BindingTrackerRegistry {
     pub fn new() -> Self {
         Self::default()
@@ -73,10 +97,52 @@ impl BindingTrackerRegistry {
         formation_count: usize,
         temporal_window: u64,
     ) -> Vec<(String, String, String, String, f32)> {
+        let tracker = self
+            .trackers
+            .entry(tracker_id)
+            .or_insert_with(BindingTracker::new);
+        let ready_pairs = tracker.record_detailed(active_patterns, tick, formation_count, temporal_window);
+        let ready_keys = ready_pairs
+            .iter()
+            .map(BindingReadyPair::key)
+            .collect::<Vec<_>>();
+        tracker.consume(&ready_keys);
+        ready_pairs
+            .into_iter()
+            .map(|pair| {
+                (
+                    pair.trace_id_a,
+                    pair.region_a,
+                    pair.trace_id_b,
+                    pair.region_b,
+                    pair.avg_delta,
+                )
+            })
+            .collect()
+    }
+
+    pub fn record_detailed(
+        &mut self,
+        tracker_id: u64,
+        active_patterns: Vec<(String, String)>,
+        tick: u64,
+        formation_count: usize,
+        temporal_window: u64,
+    ) -> Vec<BindingReadyPair> {
         self.trackers
             .entry(tracker_id)
             .or_insert_with(BindingTracker::new)
-            .record(active_patterns, tick, formation_count, temporal_window)
+            .record_detailed(active_patterns, tick, formation_count, temporal_window)
+    }
+
+    pub fn consume(
+        &mut self,
+        tracker_id: u64,
+        keys: Vec<(String, String, String, String)>,
+    ) {
+        if let Some(tracker) = self.trackers.get_mut(&tracker_id) {
+            tracker.consume(&keys);
+        }
     }
 
     pub fn cleanup(&mut self, tracker_id: u64, current_tick: u64, max_age: u64) {
@@ -113,7 +179,7 @@ impl NovelPatternTracker {
         min_regions: usize,
         persistence_required: usize,
     ) -> Vec<HashMap<String, Vec<u32>>> {
-        if novelty < 0.1 {
+        if novelty < 0.01 {
             return Vec::new();
         }
 
@@ -172,23 +238,25 @@ impl BindingTracker {
         self.co_activations.clear();
     }
 
-    fn record(
+    fn record_detailed(
         &mut self,
         active_patterns: Vec<(String, String)>,
         tick: u64,
         formation_count: usize,
         temporal_window: u64,
-    ) -> Vec<(String, String, String, String, f32)> {
+    ) -> Vec<BindingReadyPair> {
         if active_patterns.len() < 2 {
             return Vec::new();
         }
 
         let mut ready = Vec::new();
-        let mut ready_keys = Vec::new();
 
         for i in 0..active_patterns.len() {
             let (tid_a, region_a) = &active_patterns[i];
             for (tid_b, region_b) in active_patterns.iter().skip(i + 1) {
+                if tid_a == tid_b {
+                    continue;
+                }
                 if region_a == region_b {
                     continue;
                 }
@@ -207,24 +275,36 @@ impl BindingTracker {
                     if last.saturating_sub(first)
                         <= temporal_window.saturating_mul(formation_count as u64)
                     {
-                        ready.push((
-                            key.0.clone(),
-                            key.1.clone(),
-                            key.2.clone(),
-                            key.3.clone(),
-                            0.0,
-                        ));
-                        ready_keys.push(key);
+                        let support_count = activations.len();
+                        let span_ticks = last.saturating_sub(first);
+                        let avg_delta = if support_count > 1 {
+                            span_ticks as f32 / (support_count as f32 - 1.0)
+                        } else {
+                            0.0
+                        };
+                        ready.push(BindingReadyPair {
+                            trace_id_a: key.0.clone(),
+                            region_a: key.1.clone(),
+                            trace_id_b: key.2.clone(),
+                            region_b: key.3.clone(),
+                            avg_delta,
+                            support_count,
+                            span_ticks,
+                            first_tick: first,
+                            last_tick: last,
+                        });
                     }
                 }
             }
         }
 
-        for key in ready_keys {
-            self.co_activations.remove(&key);
-        }
-
         ready
+    }
+
+    fn consume(&mut self, keys: &[(String, String, String, String)]) {
+        for key in keys {
+            self.co_activations.remove(key);
+        }
     }
 
     fn cleanup(&mut self, current_tick: u64, max_age: u64) {
@@ -360,5 +440,132 @@ mod tests {
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].0, "t1");
         assert_eq!(ready[0].2, "t2");
+    }
+
+    #[test]
+    fn test_binding_tracker_requires_repeats_within_effective_horizon() {
+        let mut registry = BindingTrackerRegistry::new();
+        registry.create_tracker(1);
+
+        for tick in [0_u64, 3, 6, 9] {
+            let ready = registry.record(
+                1,
+                vec![
+                    ("t1".to_string(), "visual".to_string()),
+                    ("t2".to_string(), "audio".to_string()),
+                ],
+                tick,
+                5,
+                2,
+            );
+            assert!(ready.is_empty());
+        }
+
+        let ready = registry.record(
+            1,
+            vec![
+                ("t1".to_string(), "visual".to_string()),
+                ("t2".to_string(), "audio".to_string()),
+            ],
+            12,
+            5,
+            2,
+        );
+
+        assert!(ready.is_empty());
+    }
+
+    #[test]
+    fn test_binding_tracker_ignores_same_trace_multi_region_pairs() {
+        let mut registry = BindingTrackerRegistry::new();
+        registry.create_tracker(1);
+
+        let ready = registry.record(
+            1,
+            vec![
+                ("t1".to_string(), "visual".to_string()),
+                ("t1".to_string(), "audio".to_string()),
+                ("t2".to_string(), "audio".to_string()),
+            ],
+            0,
+            1,
+            1,
+        );
+
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].0, "t1");
+        assert_eq!(ready[0].1, "visual");
+        assert_eq!(ready[0].2, "t2");
+        assert_eq!(ready[0].3, "audio");
+    }
+
+    #[test]
+    fn test_binding_tracker_detailed_ready_pairs_persist_until_consumed() {
+        let mut registry = BindingTrackerRegistry::new();
+        registry.create_tracker(1);
+
+        for tick in 0..4 {
+            let ready = registry.record_detailed(
+                1,
+                vec![
+                    ("t1".to_string(), "visual".to_string()),
+                    ("t2".to_string(), "audio".to_string()),
+                ],
+                tick,
+                5,
+                5,
+            );
+            assert!(ready.is_empty());
+        }
+
+        let ready = registry.record_detailed(
+            1,
+            vec![
+                ("t1".to_string(), "visual".to_string()),
+                ("t2".to_string(), "audio".to_string()),
+            ],
+            4,
+            5,
+            5,
+        );
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].support_count, 5);
+        assert_eq!(ready[0].first_tick, 0);
+        assert_eq!(ready[0].last_tick, 4);
+
+        let ready_again = registry.record_detailed(
+            1,
+            vec![
+                ("t1".to_string(), "visual".to_string()),
+                ("t2".to_string(), "audio".to_string()),
+            ],
+            5,
+            5,
+            5,
+        );
+        assert_eq!(ready_again.len(), 1);
+        assert_eq!(ready_again[0].last_tick, 5);
+
+        registry.consume(
+            1,
+            vec![(
+                "t1".to_string(),
+                "visual".to_string(),
+                "t2".to_string(),
+                "audio".to_string(),
+            )],
+        );
+
+        let after_consume = registry.record_detailed(
+            1,
+            vec![
+                ("t1".to_string(), "visual".to_string()),
+                ("t2".to_string(), "audio".to_string()),
+            ],
+            6,
+            5,
+            5,
+        );
+        assert!(after_consume.is_empty());
     }
 }

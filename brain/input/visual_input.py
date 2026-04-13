@@ -30,6 +30,22 @@ _HIGH_END = 15000    # 24999
 _SPATIAL_START = 15000  # 25000
 _SPATIAL_END = 20000    # 29999
 
+VISUAL_TRACE_FEATURE_FAMILIES = ("low", "mid", "spatial")
+
+
+def visual_family_for_neuron(global_id: int) -> str | None:
+    """Return the visual feature family for a global neuron ID."""
+    local = global_id - _VIS_START
+    if _LOW_START <= local < _LOW_END:
+        return "low"
+    if _MID_START <= local < _MID_END:
+        return "mid"
+    if _HIGH_START <= local < _HIGH_END:
+        return "high"
+    if _SPATIAL_START <= local < _SPATIAL_END:
+        return "spatial"
+    return None
+
 # Target image dimensions for processing
 _TARGET_WIDTH = 32
 _TARGET_HEIGHT = 32

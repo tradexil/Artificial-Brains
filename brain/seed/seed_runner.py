@@ -38,6 +38,7 @@ def seed_brain(
     seed: int = 42,
     save_dir: str | None = None,
     verbose: bool = True,
+    chunk_count: int | None = None,
 ) -> tuple:
     """Run the full seed procedure.
 
@@ -53,7 +54,7 @@ def seed_brain(
     rng_traces = random.Random(seed + 1)
 
     t0 = time.time()
-    locality_chunks = max(1, brain_core.get_num_threads())
+    locality_chunks = max(1, chunk_count or brain_core.get_num_threads())
 
     # --- Step 1: Spawn within-region synapses ---
     if verbose:
@@ -156,6 +157,7 @@ def seed_brain_fast(
     n_traces: int = 5000,
     seed: int = 42,
     verbose: bool = True,
+    chunk_count: int | None = None,
 ) -> tuple:
     """Lightweight seed for fast interactive learning (fewer traces, fewer synapses).
 
@@ -171,7 +173,7 @@ def seed_brain_fast(
     rng_traces = random.Random(seed + 1)
 
     t0 = time.time()
-    locality_chunks = max(1, brain_core.get_num_threads())
+    locality_chunks = max(1, chunk_count or brain_core.get_num_threads())
 
     # Within-region synapses (same as full)
     if verbose:

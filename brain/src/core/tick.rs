@@ -6,12 +6,17 @@
 ///
 /// Phase 3 (Learn) and Phase 4 (Maintain) are driven by Python.
 
-use crate::core::propagate::{propagate, deliver_delayed_signals, DelayBuffer};
-use crate::core::region::{Region, RegionId};
+use crate::core::propagate::{
+    deliver_wave_signals, propagate_wave, DelayBuffer, DeliveryStats, PropagationStats,
+    SameRegionDelayAblation,
+};
+use crate::core::region::{LaneId, Region, RegionId};
 use crate::core::synapse::SynapsePool;
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::time::Instant;
+
+const DEFAULT_ACTIVE_THRESHOLD: f32 = 0.5;
 
 #[derive(Debug, Clone, Default)]
 pub struct TickProfile {
@@ -19,11 +24,66 @@ pub struct TickProfile {
     pub delayed_delivery_ms: f64,
     pub propagate_ms: f64,
     pub update_ms: f64,
+    pub incoming_signal_count: u64,
+    pub incoming_signal_abs_sum: f64,
+    pub immediate_signal_count: u64,
+    pub immediate_signal_abs_sum: f64,
+    pub delayed_delivery_signal_count: u64,
+    pub delayed_delivery_signal_abs_sum: f64,
+    pub scheduled_delayed_signal_count: u64,
+    pub scheduled_delayed_signal_abs_sum: f64,
+    pub total_fired: u32,
+    pub incoming_region_signal_counts: [u64; 14],
+    pub incoming_region_signal_abs_sums: [f64; 14],
+    pub fired_region_counts: [u32; 14],
+    pub delayed_flow_signal_counts: [[u64; 14]; 14],
+    pub delayed_flow_signal_abs_sums: [[f64; 14]; 14],
+    pub region_positive_pre_leak_sums: [f64; 14],
+    pub region_positive_leak_loss_sums: [f64; 14],
+    pub region_positive_reset_sums: [f64; 14],
+    pub region_positive_carried_sums: [f64; 14],
+    pub region_refractory_ignored_abs_sums: [f64; 14],
+    pub region_refractory_ignored_immediate_same_abs_sums: [f64; 14],
+    pub region_refractory_ignored_immediate_cross_abs_sums: [f64; 14],
+    pub region_refractory_ignored_delayed_same_abs_sums: [f64; 14],
+    pub region_refractory_ignored_delayed_cross_abs_sums: [f64; 14],
+    pub region_fire_interval_sums: [f64; 14],
+    pub region_fire_interval_counts: [u64; 14],
 }
 
 impl TickProfile {
     pub fn total_ms(&self) -> f64 {
         self.prepare_ms + self.delayed_delivery_ms + self.propagate_ms + self.update_ms
+    }
+
+    fn record_delayed_delivery(&mut self, stats: &DeliveryStats) {
+        self.incoming_signal_count += stats.signal_count;
+        self.incoming_signal_abs_sum += stats.signal_abs_sum;
+        self.delayed_delivery_signal_count += stats.signal_count;
+        self.delayed_delivery_signal_abs_sum += stats.signal_abs_sum;
+        for idx in 0..RegionId::ALL.len() {
+            self.incoming_region_signal_counts[idx] += stats.target_signal_counts[idx];
+            self.incoming_region_signal_abs_sums[idx] += stats.target_signal_abs_sums[idx];
+        }
+    }
+
+    fn record_propagation(&mut self, stats: &PropagationStats) {
+        self.incoming_signal_count += stats.immediate_signal_count;
+        self.incoming_signal_abs_sum += stats.immediate_signal_abs_sum;
+        self.immediate_signal_count += stats.immediate_signal_count;
+        self.immediate_signal_abs_sum += stats.immediate_signal_abs_sum;
+        self.scheduled_delayed_signal_count += stats.scheduled_delayed_signal_count;
+        self.scheduled_delayed_signal_abs_sum += stats.scheduled_delayed_signal_abs_sum;
+        for idx in 0..RegionId::ALL.len() {
+            self.incoming_region_signal_counts[idx] += stats.target_signal_counts[idx];
+            self.incoming_region_signal_abs_sums[idx] += stats.target_signal_abs_sums[idx];
+            for target_idx in 0..RegionId::ALL.len() {
+                self.delayed_flow_signal_counts[idx][target_idx] +=
+                    stats.delayed_flow_signal_counts[idx][target_idx];
+                self.delayed_flow_signal_abs_sums[idx][target_idx] +=
+                    stats.delayed_flow_signal_abs_sums[idx][target_idx];
+            }
+        }
     }
 }
 
@@ -36,57 +96,120 @@ pub struct TickResult {
     pub profile: TickProfile,
 }
 
+#[inline]
+fn lane_activity_mask(tick_number: u64) -> [bool; LaneId::ALL.len()] {
+    let mut active = [false; LaneId::ALL.len()];
+    for lane in LaneId::ALL {
+        active[lane.index()] = lane.is_scheduled_on(tick_number);
+    }
+    active
+}
+
+#[inline]
+fn region_activity_mask(tick_number: u64) -> [bool; RegionId::ALL.len()] {
+    let mut active = [false; RegionId::ALL.len()];
+    for region_id in RegionId::ALL {
+        active[region_id.index()] = region_id.is_scheduled_on(tick_number);
+    }
+    active
+}
+
 /// Execute one complete tick cycle.
 ///
-/// 1. Swap activation buffers (prev ← current)
-/// 2. Deliver delayed signals from previous ticks
-/// 3. Propagate: active neurons push signal through synapses
-/// 4. Deliver immediate signals
-/// 5. Update: each region integrates incoming and fires
+/// 1. Prepare one lane at a time (swap activation buffers for that lane only)
+/// 2. Deliver any mailbox signals ready for that lane
+/// 3. Propagate only from that lane's previous-tick activations
+/// 4. Update only that lane's neurons
+/// 5. Advance the delayed ring once after all waves complete
 pub fn tick(
     regions: &mut Vec<Region>,
     synapse_pool: &SynapsePool,
     delay_buffer: &mut DelayBuffer,
     attention_gains: &HashMap<RegionId, f32>,
+    same_region_delay_ablation: &SameRegionDelayAblation,
     tick_number: u64,
 ) -> TickResult {
     let mut profile = TickProfile::default();
+    let mut active_counts = HashMap::new();
+    let lane_active = lane_activity_mask(tick_number);
+    let region_active = region_activity_mask(tick_number);
 
-    // Phase 0: Prepare — swap buffers, clear incoming (parallel)
-    let phase_started = Instant::now();
-    regions.par_iter_mut().for_each(|region| {
-        region.pre_tick();
-    });
-    profile.prepare_ms = phase_started.elapsed().as_secs_f64() * 1000.0;
+    for lane in LaneId::ALL {
+        if !lane_active[lane.index()] {
+            delay_buffer.carry_current_wave_to_next(lane);
+            continue;
+        }
 
-    // Phase 1a: Deliver signals that were delayed from previous ticks
-    let phase_started = Instant::now();
-    deliver_delayed_signals(regions, delay_buffer);
-    profile.delayed_delivery_ms += phase_started.elapsed().as_secs_f64() * 1000.0;
+        let phase_started = Instant::now();
+        regions
+            .par_iter_mut()
+            .filter(|region| region.id.lane() == lane && region_active[region.id.index()])
+            .for_each(|region| {
+                region.pre_tick();
+            });
+        profile.prepare_ms += phase_started.elapsed().as_secs_f64() * 1000.0;
 
-    // Phase 1b: Propagate — active neurons push signal through synapses (parallel)
-    // Propagation uses rayon internally to parallelize across regions.
-    let phase_started = Instant::now();
-    propagate(regions, synapse_pool, delay_buffer, attention_gains);
-    profile.propagate_ms = phase_started.elapsed().as_secs_f64() * 1000.0;
+        let phase_started = Instant::now();
+        let delayed_stats = deliver_wave_signals(regions, delay_buffer, lane, &region_active);
+        profile.record_delayed_delivery(&delayed_stats);
+        profile.delayed_delivery_ms += phase_started.elapsed().as_secs_f64() * 1000.0;
 
-    // Phase 1c: Deliver immediate signals (delay=0 scheduled this tick)
-    let phase_started = Instant::now();
-    deliver_delayed_signals(regions, delay_buffer);
-    profile.delayed_delivery_ms += phase_started.elapsed().as_secs_f64() * 1000.0;
+        let phase_started = Instant::now();
+        let propagation_stats = propagate_wave(
+            regions,
+            synapse_pool,
+            delay_buffer,
+            attention_gains,
+            same_region_delay_ablation,
+            lane,
+            &region_active,
+        );
+        profile.record_propagation(&propagation_stats);
+        profile.propagate_ms += phase_started.elapsed().as_secs_f64() * 1000.0;
 
-    // Phase 2: Update — each region integrates incoming signals (parallel)
-    let phase_started = Instant::now();
-    let active_counts_vec: Vec<(RegionId, u32)> = regions
-        .par_iter_mut()
-        .map(|region| {
-            let count = region.update_neurons();
-            (region.id, count)
-        })
-        .collect();
-    profile.update_ms = phase_started.elapsed().as_secs_f64() * 1000.0;
-    let total_active = active_counts_vec.iter().map(|(_, count)| *count).sum();
-    let active_counts: HashMap<RegionId, u32> = active_counts_vec.into_iter().collect();
+        let phase_started = Instant::now();
+        let update_stats_vec: Vec<(RegionId, crate::core::neuron::UpdateStats)> = regions
+            .par_iter_mut()
+            .filter(|region| region.id.lane() == lane && region_active[region.id.index()])
+            .map(|region| {
+                let stats = region.update_neurons_at(tick_number);
+                (region.id, stats)
+            })
+            .collect();
+        profile.update_ms += phase_started.elapsed().as_secs_f64() * 1000.0;
+
+        for (region_id, stats) in &update_stats_vec {
+            active_counts.insert(*region_id, stats.active_count);
+            profile.total_fired += stats.fired_count;
+            profile.fired_region_counts[region_id.index()] = stats.fired_count;
+            profile.region_positive_pre_leak_sums[region_id.index()] = stats.positive_pre_leak_sum;
+            profile.region_positive_leak_loss_sums[region_id.index()] = stats.positive_leak_loss_sum;
+            profile.region_positive_reset_sums[region_id.index()] = stats.positive_reset_sum;
+            profile.region_positive_carried_sums[region_id.index()] = stats.positive_carried_sum;
+            profile.region_refractory_ignored_abs_sums[region_id.index()] =
+                stats.refractory_ignored_abs_sum;
+            profile.region_refractory_ignored_immediate_same_abs_sums[region_id.index()] =
+                stats.refractory_ignored_immediate_same_abs_sum;
+            profile.region_refractory_ignored_immediate_cross_abs_sums[region_id.index()] =
+                stats.refractory_ignored_immediate_cross_abs_sum;
+            profile.region_refractory_ignored_delayed_same_abs_sums[region_id.index()] =
+                stats.refractory_ignored_delayed_same_abs_sum;
+            profile.region_refractory_ignored_delayed_cross_abs_sums[region_id.index()] =
+                stats.refractory_ignored_delayed_cross_abs_sum;
+            profile.region_fire_interval_sums[region_id.index()] = stats.fire_interval_sum;
+            profile.region_fire_interval_counts[region_id.index()] = stats.fire_interval_count;
+        }
+    }
+
+    for region in regions.iter() {
+        active_counts
+            .entry(region.id)
+            .or_insert_with(|| region.active_count(DEFAULT_ACTIVE_THRESHOLD));
+    }
+
+    let total_active = active_counts.values().copied().sum();
+
+    delay_buffer.advance();
 
     TickResult {
         tick_number,
@@ -108,9 +231,18 @@ mod tests {
         let mut delay_buf = DelayBuffer::new();
         let gains = HashMap::new();
 
-        let result = tick(&mut regions, &pool, &mut delay_buf, &gains, 0);
+        let result = tick(
+            &mut regions,
+            &pool,
+            &mut delay_buf,
+            &gains,
+            &SameRegionDelayAblation::default(),
+            0,
+        );
         assert_eq!(result.tick_number, 0);
         assert_eq!(result.total_active, 0);
+        assert_eq!(result.profile.incoming_signal_count, 0);
+        assert_eq!(result.profile.total_fired, 0);
     }
 
     #[test]
@@ -124,11 +256,20 @@ mod tests {
         // Sensory threshold = 0.3, so 0.5 should fire after leak (0.5 * 0.85 = 0.425 > 0.3)
         regions[0].neurons.inject(&[(0, 0.5), (1, 0.5), (2, 0.5)]);
 
-        let result = tick(&mut regions, &pool, &mut delay_buf, &gains, 0);
+        let result = tick(
+            &mut regions,
+            &pool,
+            &mut delay_buf,
+            &gains,
+            &SameRegionDelayAblation::default(),
+            0,
+        );
 
         // Should have some active neurons in sensory
         let sensory_active = result.active_counts.get(&RegionId::Sensory).copied().unwrap_or(0);
         assert!(sensory_active > 0, "Expected sensory neurons to fire");
+        assert!(result.profile.total_fired > 0);
+        assert!(result.profile.fired_region_counts[RegionId::Sensory.index()] > 0);
     }
 
     #[test]
@@ -149,10 +290,36 @@ mod tests {
 
         // Tick 0: Inject and fire sensory neuron 0
         regions[0].neurons.inject(&[(0, 0.5)]);
-        let _r0 = tick(&mut regions, &pool, &mut delay_buf, &gains, 0);
+        let _r0 = tick(
+            &mut regions,
+            &pool,
+            &mut delay_buf,
+            &gains,
+            &SameRegionDelayAblation::default(),
+            0,
+        );
 
-        // Tick 1: Signal should propagate to emotion via delay buffer
-        let _r1 = tick(&mut regions, &pool, &mut delay_buf, &gains, 1);
+        // Tick 1: cognition is off-cadence, so the ready signal is carried forward.
+        let r1 = tick(
+            &mut regions,
+            &pool,
+            &mut delay_buf,
+            &gains,
+            &SameRegionDelayAblation::default(),
+            1,
+        );
+
+        assert_eq!(r1.profile.incoming_signal_count, 0);
+
+        // Tick 2: cognition runs again, so the delayed signal should arrive.
+        let r2 = tick(
+            &mut regions,
+            &pool,
+            &mut delay_buf,
+            &gains,
+            &SameRegionDelayAblation::default(),
+            2,
+        );
 
         // Emotion neuron should have received something
         // (may or may not fire depending on accumulated potential + threshold)
@@ -169,5 +336,7 @@ mod tests {
             "Expected emotion neuron to receive signal. activation={}, potential={}",
             emotion_activation, emotion_potential
         );
+        assert!(r2.profile.incoming_signal_count > 0);
+        assert!(r2.profile.incoming_region_signal_counts[RegionId::Emotion.index()] > 0);
     }
 }

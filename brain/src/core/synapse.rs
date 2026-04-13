@@ -8,10 +8,229 @@
 
 use crate::core::neuron::NeuronType;
 use crate::core::region::RegionId;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
+
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::System::Memory::{
+    MapViewOfFile,
+    MEMORY_MAPPED_VIEW_ADDRESS,
+    OpenFileMappingW,
+    UnmapViewOfFile,
+    FILE_MAP_ALL_ACCESS,
+};
 
 const CANONICAL_TOTAL_NEURONS: u32 = 152_000;
+const REGION_COUNT: usize = 14;
+const DELAY_BUCKETS: usize = 256;
+const WEIGHT_BYTES_PER_ENTRY: usize = std::mem::size_of::<f32>();
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SharedWeightBuffer {
+    len: usize,
+    #[cfg(target_os = "windows")]
+    handle: HANDLE,
+    #[cfg(target_os = "windows")]
+    view: MEMORY_MAPPED_VIEW_ADDRESS,
+}
+
+unsafe impl Send for SharedWeightBuffer {}
+unsafe impl Sync for SharedWeightBuffer {}
+
+impl SharedWeightBuffer {
+    fn open(name: &str, len: usize, size_bytes: usize) -> Result<Self, String> {
+        let expected_bytes = len.saturating_mul(WEIGHT_BYTES_PER_ENTRY);
+        if size_bytes != expected_bytes {
+            return Err(format!(
+                "Shared weight buffer size {} does not match expected {} bytes",
+                size_bytes, expected_bytes,
+            ));
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            let wide_name = name
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect::<Vec<u16>>();
+            unsafe {
+                let handle = OpenFileMappingW(FILE_MAP_ALL_ACCESS, 0, wide_name.as_ptr());
+                if handle.is_null() {
+                    return Err(format!(
+                        "Failed to open shared weight buffer '{}'",
+                        name,
+                    ));
+                }
+
+                let view = MapViewOfFile(handle, FILE_MAP_ALL_ACCESS, 0, 0, size_bytes);
+                if view.Value.is_null() {
+                    CloseHandle(handle);
+                    return Err(format!(
+                        "Failed to map shared weight buffer '{}'",
+                        name,
+                    ));
+                }
+
+                Ok(Self { len, handle, view })
+            }
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = (name, len, size_bytes);
+            Err("Shared weight buffers are only supported on Windows".to_string())
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[inline]
+    fn atomics(&self) -> &[AtomicU32] {
+        unsafe { std::slice::from_raw_parts(self.view.Value.cast::<AtomicU32>(), self.len) }
+    }
+
+    #[inline]
+    fn load(&self, index: usize) -> f32 {
+        #[cfg(target_os = "windows")]
+        {
+            return f32::from_bits(self.atomics()[index].load(Ordering::Relaxed));
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = index;
+            unreachable!("shared weights are unsupported on this platform")
+        }
+    }
+
+    #[inline]
+    fn store(&self, index: usize, value: f32) {
+        #[cfg(target_os = "windows")]
+        {
+            self.atomics()[index].store(value.to_bits(), Ordering::Relaxed);
+            return;
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = (index, value);
+            unreachable!("shared weights are unsupported on this platform")
+        }
+    }
+
+    #[inline]
+    fn fetch_add_clamped(&self, index: usize, delta: f32) -> (f32, f32) {
+        #[cfg(target_os = "windows")]
+        {
+            let atomic = &self.atomics()[index];
+            let mut observed = atomic.load(Ordering::Relaxed);
+            loop {
+                let before = f32::from_bits(observed);
+                let after = (before + delta).clamp(0.0, 1.0);
+                match atomic.compare_exchange_weak(
+                    observed,
+                    after.to_bits(),
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => return (before, after),
+                    Err(next_observed) => observed = next_observed,
+                }
+            }
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = (index, delta);
+            unreachable!("shared weights are unsupported on this platform")
+        }
+    }
+}
+
+impl Drop for SharedWeightBuffer {
+    fn drop(&mut self) {
+        #[cfg(target_os = "windows")]
+        unsafe {
+            if !self.view.Value.is_null() {
+                UnmapViewOfFile(self.view);
+            }
+            if !self.handle.is_null() {
+                CloseHandle(self.handle);
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ApplyWeightUpdatesProfile {
+    pub pending_update_count: u64,
+    pub deferred_update_count: u64,
+    pub applied_update_count: u64,
+    pub unmatched_update_count: u64,
+    pub positive_update_count: u64,
+    pub negative_update_count: u64,
+    pub delta_sum: f64,
+    pub delta_abs_sum: f64,
+    pub delta_min: f32,
+    pub delta_max: f32,
+    pub before_weight_sum: f64,
+    pub after_weight_sum: f64,
+    pub crossed_up_0p05_count: u64,
+    pub crossed_up_0p10_count: u64,
+    pub crossed_up_0p20_count: u64,
+    pub crossed_down_0p05_count: u64,
+    pub crossed_down_0p10_count: u64,
+    pub crossed_down_0p20_count: u64,
+    pub region_pair_update_counts: [[u64; REGION_COUNT]; REGION_COUNT],
+    pub region_pair_delta_abs_sums: [[f64; REGION_COUNT]; REGION_COUNT],
+    pub region_pair_before_weight_sums: [[f64; REGION_COUNT]; REGION_COUNT],
+    pub region_pair_after_weight_sums: [[f64; REGION_COUNT]; REGION_COUNT],
+    pub delay_update_counts: [u64; DELAY_BUCKETS],
+    pub delay_delta_abs_sums: [f64; DELAY_BUCKETS],
+}
+
+impl Default for ApplyWeightUpdatesProfile {
+    fn default() -> Self {
+        Self {
+            pending_update_count: 0,
+            deferred_update_count: 0,
+            applied_update_count: 0,
+            unmatched_update_count: 0,
+            positive_update_count: 0,
+            negative_update_count: 0,
+            delta_sum: 0.0,
+            delta_abs_sum: 0.0,
+            delta_min: f32::INFINITY,
+            delta_max: f32::NEG_INFINITY,
+            before_weight_sum: 0.0,
+            after_weight_sum: 0.0,
+            crossed_up_0p05_count: 0,
+            crossed_up_0p10_count: 0,
+            crossed_up_0p20_count: 0,
+            crossed_down_0p05_count: 0,
+            crossed_down_0p10_count: 0,
+            crossed_down_0p20_count: 0,
+            region_pair_update_counts: [[0u64; REGION_COUNT]; REGION_COUNT],
+            region_pair_delta_abs_sums: [[0.0f64; REGION_COUNT]; REGION_COUNT],
+            region_pair_before_weight_sums: [[0.0f64; REGION_COUNT]; REGION_COUNT],
+            region_pair_after_weight_sums: [[0.0f64; REGION_COUNT]; REGION_COUNT],
+            delay_update_counts: [0u64; DELAY_BUCKETS],
+            delay_delta_abs_sums: [0.0f64; DELAY_BUCKETS],
+        }
+    }
+}
+
+impl ApplyWeightUpdatesProfile {
+    fn finalize(&mut self) {
+        if self.applied_update_count == 0 {
+            self.delta_min = 0.0;
+            self.delta_max = 0.0;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum ChunkLayout {
     Contiguous,
     CanonicalRegionBuckets,
@@ -81,7 +300,7 @@ fn chunk_for_neuron_with(
 }
 
 /// A single synapse's data (used during construction / pending ops).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct SynapseData {
     pub from: u32,
     pub to: u32,
@@ -91,14 +310,28 @@ pub struct SynapseData {
 }
 
 /// Queued weight modification.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct SynapseUpdate {
     pub from: u32,
     pub to: u32,
     pub delta: f32,
+    pub synapse_index: u32,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct SynapseRuntimeState {
+    pending_updates: Vec<SynapseUpdate>,
+    pending_creates: Vec<SynapseData>,
+    pending_prunes: Vec<(u32, u32)>,
+    total_count: u64,
+    create_count: u64,
+    prune_count: u64,
+    local_chunk_synapses: u64,
+    cross_chunk_synapses: u64,
 }
 
 /// CSR synapse pool — the main synapse storage.
+#[derive(Serialize, Deserialize)]
 pub struct SynapsePool {
     /// Total number of "source" slots = max global neuron ID + 1.
     num_neurons: u32,
@@ -122,6 +355,13 @@ pub struct SynapsePool {
     pending_updates: Vec<SynapseUpdate>,
     pending_creates: Vec<SynapseData>,
     pending_prunes: Vec<(u32, u32)>, // (from, to)
+
+    #[serde(skip)]
+    round_delta_baselines: HashMap<u32, f32>,
+    #[serde(skip)]
+    round_delta_effective: HashMap<u32, f32>,
+    #[serde(skip)]
+    shared_weights: Option<SharedWeightBuffer>,
 
     // Stats
     pub total_count: u64,
@@ -157,6 +397,9 @@ impl SynapsePool {
             pending_updates: Vec::new(),
             pending_creates: Vec::new(),
             pending_prunes: Vec::new(),
+            round_delta_baselines: HashMap::new(),
+            round_delta_effective: HashMap::new(),
+            shared_weights: None,
             total_count: 0,
             create_count: 0,
             prune_count: 0,
@@ -166,7 +409,7 @@ impl SynapsePool {
     }
 
     /// Build CSR from a list of synapses. Synapses do NOT need to be sorted.
-    pub fn from_synapses(num_neurons: u32, mut synapses: Vec<SynapseData>) -> Self {
+    pub fn from_synapses(num_neurons: u32, synapses: Vec<SynapseData>) -> Self {
         Self::from_synapses_with_chunks(num_neurons, synapses, rayon::current_num_threads())
     }
 
@@ -249,6 +492,9 @@ impl SynapsePool {
             pending_updates: Vec::new(),
             pending_creates: Vec::new(),
             pending_prunes: Vec::new(),
+            round_delta_baselines: HashMap::new(),
+            round_delta_effective: HashMap::new(),
+            shared_weights: None,
             total_count: total as u64,
             create_count: 0,
             prune_count: 0,
@@ -266,6 +512,84 @@ impl SynapsePool {
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.targets.is_empty()
+    }
+
+    #[inline]
+    pub fn shared_weights_attached(&self) -> bool {
+        self.shared_weights.is_some()
+    }
+
+    pub fn attach_shared_weight_buffer(&mut self, name: &str, size_bytes: usize) -> Result<(), String> {
+        self.shared_weights = Some(SharedWeightBuffer::open(name, self.weights.len(), size_bytes)?);
+        Ok(())
+    }
+
+    pub fn refresh_owned_weights_from_shared(&mut self) {
+        if let Some(shared_weights) = &self.shared_weights {
+            for (index, weight) in self.weights.iter_mut().enumerate() {
+                *weight = shared_weights.load(index);
+            }
+        }
+    }
+
+    pub fn copy_weights_to_slice(&self, target: &mut [f32]) -> Result<(), String> {
+        if target.len() != self.weights.len() {
+            return Err(format!(
+                "Synapse weight buffer length {} does not match synapse count {}",
+                target.len(),
+                self.weights.len(),
+            ));
+        }
+
+        if let Some(shared_weights) = &self.shared_weights {
+            for (index, slot) in target.iter_mut().enumerate() {
+                *slot = shared_weights.load(index);
+            }
+        } else {
+            target.copy_from_slice(&self.weights);
+        }
+
+        Ok(())
+    }
+
+    pub fn overwrite_weights_from_slice(&mut self, source: &[f32]) -> Result<(), String> {
+        if source.len() != self.weights.len() {
+            return Err(format!(
+                "Synapse weight buffer length {} does not match synapse count {}",
+                source.len(),
+                self.weights.len(),
+            ));
+        }
+
+        self.weights.copy_from_slice(source);
+        if let Some(shared_weights) = &self.shared_weights {
+            for (index, weight) in source.iter().enumerate() {
+                shared_weights.store(index, *weight);
+            }
+        }
+        Ok(())
+    }
+
+    #[inline]
+    pub fn weight_at_index(&self, synapse_index: usize) -> Option<f32> {
+        if synapse_index >= self.weights.len() {
+            return None;
+        }
+        if let Some(shared_weights) = &self.shared_weights {
+            Some(shared_weights.load(synapse_index))
+        } else {
+            Some(self.weights[synapse_index])
+        }
+    }
+
+    #[inline]
+    pub fn atomic_add_weight_at_index(&self, synapse_index: usize, delta: f32) -> Option<(f32, f32)> {
+        if synapse_index >= self.weights.len() || delta.abs() <= f32::EPSILON {
+            return None;
+        }
+        self.shared_weights
+            .as_ref()
+            .map(|shared_weights| shared_weights.fetch_add_clamped(synapse_index, delta))
     }
 
     /// Number of neuron slots (max global_id + 1).
@@ -402,7 +726,7 @@ impl SynapsePool {
         let end = self.offsets[from as usize + 1] as usize;
         for i in start..end {
             if self.targets[i] == to {
-                return Some(self.weights[i]);
+                return self.weight_at_index(i);
             }
         }
         None
@@ -410,7 +734,149 @@ impl SynapsePool {
 
     /// Queue a weight update (applied during rebuild/apply).
     pub fn queue_update(&mut self, from: u32, to: u32, delta: f32) {
-        self.pending_updates.push(SynapseUpdate { from, to, delta });
+        self.pending_updates.push(SynapseUpdate {
+            from,
+            to,
+            delta,
+            synapse_index: u32::MAX,
+        });
+    }
+
+    /// Queue a weight update for a known CSR synapse index.
+    pub fn queue_indexed_update(&mut self, from: u32, to: u32, synapse_index: u32, delta: f32) {
+        self.pending_updates.push(SynapseUpdate {
+            from,
+            to,
+            delta,
+            synapse_index,
+        });
+    }
+
+    pub fn pending_update_count(&self) -> usize {
+        self.pending_updates.len()
+    }
+
+    pub fn reset_round_delta_tracker(&mut self) {
+        self.round_delta_baselines.clear();
+        self.round_delta_effective.clear();
+    }
+
+    pub fn take_round_deltas(&mut self) -> Vec<(u32, f32)> {
+        let mut deltas = self
+            .round_delta_effective
+            .iter()
+            .map(|(&synapse_index, &delta)| (synapse_index, delta))
+            .collect::<Vec<_>>();
+        deltas.sort_unstable_by_key(|(synapse_index, _)| *synapse_index);
+        self.reset_round_delta_tracker();
+        deltas
+    }
+
+    pub fn apply_sparse_deltas_by_index(&mut self, deltas: &[(u32, f32)]) -> usize {
+        let mut applied = 0usize;
+        for &(synapse_index, delta) in deltas {
+            let idx = synapse_index as usize;
+            if idx >= self.weights.len() {
+                continue;
+            }
+            if delta.abs() <= f32::EPSILON {
+                continue;
+            }
+            if let Some(shared_weights) = &self.shared_weights {
+                let _ = shared_weights.fetch_add_clamped(idx, delta);
+            } else {
+                self.weights[idx] = (self.weights[idx] + delta).clamp(0.0, 1.0);
+            }
+            applied += 1;
+        }
+        applied
+    }
+
+    fn record_round_delta(&mut self, synapse_index: usize, before_weight: f32, after_weight: f32) {
+        let synapse_index = synapse_index as u32;
+        let baseline = *self
+            .round_delta_baselines
+            .entry(synapse_index)
+            .or_insert(before_weight);
+        let effective_delta = after_weight - baseline;
+        if effective_delta.abs() <= f32::EPSILON {
+            self.round_delta_baselines.remove(&synapse_index);
+            self.round_delta_effective.remove(&synapse_index);
+        } else {
+            self.round_delta_effective
+                .insert(synapse_index, effective_delta);
+        }
+    }
+
+    fn apply_weight_update_at_index(
+        &mut self,
+        synapse_index: usize,
+        from: u32,
+        delta: f32,
+        profile: &mut ApplyWeightUpdatesProfile,
+    ) {
+        profile.applied_update_count += 1;
+
+        if delta > 0.0 {
+            profile.positive_update_count += 1;
+        } else if delta < 0.0 {
+            profile.negative_update_count += 1;
+        }
+
+        let (before_weight, after_weight) = if let Some(shared_weights) = &self.shared_weights {
+            shared_weights.fetch_add_clamped(synapse_index, delta)
+        } else {
+            let before_weight = self.weights[synapse_index];
+            let after_weight = (before_weight + delta).clamp(0.0, 1.0);
+            self.weights[synapse_index] = after_weight;
+            (before_weight, after_weight)
+        };
+        let delta_abs = delta.abs() as f64;
+
+        profile.delta_sum += delta as f64;
+        profile.delta_abs_sum += delta_abs;
+        profile.delta_min = profile.delta_min.min(delta);
+        profile.delta_max = profile.delta_max.max(delta);
+        profile.before_weight_sum += before_weight as f64;
+        profile.after_weight_sum += after_weight as f64;
+
+        if before_weight < 0.05 && after_weight >= 0.05 {
+            profile.crossed_up_0p05_count += 1;
+        }
+        if before_weight < 0.10 && after_weight >= 0.10 {
+            profile.crossed_up_0p10_count += 1;
+        }
+        if before_weight < 0.20 && after_weight >= 0.20 {
+            profile.crossed_up_0p20_count += 1;
+        }
+        if before_weight >= 0.05 && after_weight < 0.05 {
+            profile.crossed_down_0p05_count += 1;
+        }
+        if before_weight >= 0.10 && after_weight < 0.10 {
+            profile.crossed_down_0p10_count += 1;
+        }
+        if before_weight >= 0.20 && after_weight < 0.20 {
+            profile.crossed_down_0p20_count += 1;
+        }
+
+        let target = self.targets[synapse_index];
+        if let (Some(src_region), Some(tgt_region)) = (
+            RegionId::from_neuron_id(from),
+            RegionId::from_neuron_id(target),
+        ) {
+            let src_idx = src_region.index();
+            let tgt_idx = tgt_region.index();
+            profile.region_pair_update_counts[src_idx][tgt_idx] += 1;
+            profile.region_pair_delta_abs_sums[src_idx][tgt_idx] += delta_abs;
+            profile.region_pair_before_weight_sums[src_idx][tgt_idx] += before_weight as f64;
+            profile.region_pair_after_weight_sums[src_idx][tgt_idx] += after_weight as f64;
+        }
+
+        let delay_idx = self.delays[synapse_index] as usize;
+        profile.delay_update_counts[delay_idx] += 1;
+        profile.delay_delta_abs_sums[delay_idx] += delta_abs;
+
+        self.record_round_delta(synapse_index, before_weight, after_weight);
     }
 
     /// Queue a new synapse creation.
@@ -426,19 +892,90 @@ impl SynapsePool {
     /// Apply all pending weight updates without rebuilding CSR.
     /// This is cheap — just walks the update buffer.
     pub fn apply_weight_updates(&mut self) {
-        for update in self.pending_updates.drain(..) {
+        let _ = self.apply_weight_updates_profiled();
+    }
+
+    pub fn apply_weight_updates_profiled(&mut self) -> ApplyWeightUpdatesProfile {
+        self.apply_weight_updates_profiled_bounded(usize::MAX)
+    }
+
+    pub fn apply_weight_updates_profiled_bounded(
+        &mut self,
+        max_updates: usize,
+    ) -> ApplyWeightUpdatesProfile {
+        let mut profile = ApplyWeightUpdatesProfile::default();
+        let total_pending = self.pending_updates.len();
+        profile.pending_update_count = total_pending as u64;
+
+        if total_pending == 0 {
+            profile.finalize();
+            return profile;
+        }
+
+        if max_updates == 0 {
+            profile.deferred_update_count = total_pending as u64;
+            profile.finalize();
+            return profile;
+        }
+
+        let apply_count = total_pending.min(max_updates);
+        let deferred_updates = if apply_count < total_pending {
+            self.pending_updates.split_off(apply_count)
+        } else {
+            Vec::new()
+        };
+        let pending_updates = std::mem::take(&mut self.pending_updates);
+        self.pending_updates = deferred_updates;
+        profile.deferred_update_count = self.pending_updates.len() as u64;
+
+        for update in pending_updates {
             if update.from >= self.num_neurons {
+                profile.unmatched_update_count += 1;
                 continue;
             }
+
             let start = self.offsets[update.from as usize] as usize;
             let end = self.offsets[update.from as usize + 1] as usize;
-            for i in start..end {
-                if self.targets[i] == update.to {
-                    self.weights[i] = (self.weights[i] + update.delta).clamp(0.0, 1.0);
-                    break;
+            let mut matched = false;
+
+            if update.synapse_index != u32::MAX {
+                let synapse_index = update.synapse_index as usize;
+                if synapse_index >= start
+                    && synapse_index < end
+                    && synapse_index < self.targets.len()
+                    && self.targets[synapse_index] == update.to
+                {
+                    matched = true;
+                    self.apply_weight_update_at_index(
+                        synapse_index,
+                        update.from,
+                        update.delta,
+                        &mut profile,
+                    );
                 }
             }
+
+            if matched {
+                continue;
+            }
+
+            for i in start..end {
+                if self.targets[i] != update.to {
+                    continue;
+                }
+
+                matched = true;
+                self.apply_weight_update_at_index(i, update.from, update.delta, &mut profile);
+                break;
+            }
+
+            if !matched {
+                profile.unmatched_update_count += 1;
+            }
         }
+
+        profile.finalize();
+        profile
     }
 
     /// Full rebuild: apply creates, prunes, then reconstruct CSR.
@@ -464,7 +1001,7 @@ impl SynapsePool {
                     all_synapses.push(SynapseData {
                         from,
                         to,
-                        weight: self.weights[i],
+                        weight: self.weight_at_index(i).unwrap_or(0.0),
                         delay: self.delays[i],
                         plasticity: self.plasticity[i],
                     });
@@ -494,6 +1031,7 @@ impl SynapsePool {
         self.plasticity = rebuilt.plasticity;
         self.target_chunks = rebuilt.target_chunks;
         self.offsets = rebuilt.offsets;
+    self.shared_weights = None;
         self.total_count = self.len() as u64;
         self.local_chunk_synapses = rebuilt.local_chunk_synapses;
         self.cross_chunk_synapses = rebuilt.cross_chunk_synapses;
@@ -502,6 +1040,31 @@ impl SynapsePool {
     /// How many pending modifications are queued.
     pub fn pending_count(&self) -> usize {
         self.pending_updates.len() + self.pending_creates.len() + self.pending_prunes.len()
+    }
+
+    pub fn export_runtime_state(&self) -> SynapseRuntimeState {
+        SynapseRuntimeState {
+            pending_updates: self.pending_updates.clone(),
+            pending_creates: self.pending_creates.clone(),
+            pending_prunes: self.pending_prunes.clone(),
+            total_count: self.total_count,
+            create_count: self.create_count,
+            prune_count: self.prune_count,
+            local_chunk_synapses: self.local_chunk_synapses,
+            cross_chunk_synapses: self.cross_chunk_synapses,
+        }
+    }
+
+    pub fn apply_runtime_state(&mut self, runtime_state: SynapseRuntimeState) {
+        self.pending_updates = runtime_state.pending_updates;
+        self.pending_creates = runtime_state.pending_creates;
+        self.pending_prunes = runtime_state.pending_prunes;
+        self.reset_round_delta_tracker();
+        self.total_count = runtime_state.total_count;
+        self.create_count = runtime_state.create_count;
+        self.prune_count = runtime_state.prune_count;
+        self.local_chunk_synapses = runtime_state.local_chunk_synapses;
+        self.cross_chunk_synapses = runtime_state.cross_chunk_synapses;
     }
 
     /// Summary of chunk-local vs cross-chunk synapse ownership.
@@ -582,6 +1145,98 @@ mod tests {
 
         pool.queue_update(2, 0, -0.5); // 0.2 - 0.5 = -0.3 → clamped to 0.0
         pool.apply_weight_updates();
+        assert!((pool.get_weight(2, 0).unwrap() - 0.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_apply_weight_updates_profiled_reports_region_pairs_and_threshold_crossings() {
+        let synapses = vec![
+            SynapseData { from: 55_000, to: 55_001, weight: 0.04, delay: 9, plasticity: 1.0 },
+            SynapseData { from: 70_000, to: 70_001, weight: 0.20, delay: 1, plasticity: 1.0 },
+        ];
+        let mut pool = SynapsePool::from_synapses_with_chunks(152_000, synapses, 1);
+
+        pool.queue_update(55_000, 55_001, 0.02);
+        pool.queue_update(70_000, 70_001, -0.16);
+
+        let profile = pool.apply_weight_updates_profiled();
+
+        assert_eq!(profile.pending_update_count, 2);
+        assert_eq!(profile.deferred_update_count, 0);
+        assert_eq!(profile.applied_update_count, 2);
+        assert_eq!(profile.unmatched_update_count, 0);
+        assert_eq!(profile.crossed_up_0p05_count, 1);
+        assert_eq!(profile.crossed_down_0p10_count, 1);
+        assert_eq!(profile.delay_update_counts[9], 1);
+        assert_eq!(
+            profile.region_pair_update_counts[RegionId::MemoryLong.index()][RegionId::MemoryLong.index()],
+            1,
+        );
+        assert_eq!(
+            profile.region_pair_update_counts[RegionId::Emotion.index()][RegionId::Emotion.index()],
+            1,
+        );
+        assert!((pool.get_weight(55_000, 55_001).unwrap() - 0.06).abs() < 0.001);
+        assert!((pool.get_weight(70_000, 70_001).unwrap() - 0.04).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_apply_weight_updates_profiled_bounded_defers_tail_updates() {
+        let synapses = vec![
+            SynapseData { from: 0, to: 1, weight: 0.10, delay: 1, plasticity: 1.0 },
+            SynapseData { from: 0, to: 2, weight: 0.10, delay: 1, plasticity: 1.0 },
+            SynapseData { from: 1, to: 2, weight: 0.10, delay: 1, plasticity: 1.0 },
+        ];
+        let mut pool = SynapsePool::from_synapses_with_chunks(10, synapses, 1);
+
+        pool.queue_update(0, 1, 0.05);
+        pool.queue_update(0, 2, 0.05);
+        pool.queue_update(1, 2, 0.05);
+
+        let profile = pool.apply_weight_updates_profiled_bounded(2);
+
+        assert_eq!(profile.pending_update_count, 3);
+        assert_eq!(profile.applied_update_count, 2);
+        assert_eq!(profile.deferred_update_count, 1);
+        assert!((pool.get_weight(0, 1).unwrap() - 0.15).abs() < 0.001);
+        assert!((pool.get_weight(0, 2).unwrap() - 0.15).abs() < 0.001);
+        assert!((pool.get_weight(1, 2).unwrap() - 0.10).abs() < 0.001);
+
+        let second = pool.apply_weight_updates_profiled_bounded(10);
+        assert_eq!(second.pending_update_count, 1);
+        assert_eq!(second.applied_update_count, 1);
+        assert_eq!(second.deferred_update_count, 0);
+        assert!((pool.get_weight(1, 2).unwrap() - 0.15).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_round_delta_tracker_exports_effective_sparse_deltas() {
+        let mut pool = make_pool();
+
+        pool.reset_round_delta_tracker();
+        pool.queue_indexed_update(0, 1, 0, 0.1);
+        pool.queue_indexed_update(0, 1, 0, 0.1);
+        pool.queue_indexed_update(2, 0, 3, -0.05);
+        pool.apply_weight_updates();
+
+        let deltas = pool.take_round_deltas();
+
+        assert_eq!(deltas.len(), 2);
+        assert_eq!(deltas[0].0, 0);
+        assert!((deltas[0].1 - 0.2).abs() < 0.001);
+        assert_eq!(deltas[1].0, 3);
+        assert!((deltas[1].1 + 0.05).abs() < 0.001);
+        assert!(pool.take_round_deltas().is_empty());
+    }
+
+    #[test]
+    fn test_apply_sparse_deltas_by_index_updates_weights() {
+        let mut pool = make_pool();
+
+        let applied = pool.apply_sparse_deltas_by_index(&[(0, 0.1), (3, -0.3), (99, 0.2)]);
+
+        assert_eq!(applied, 2);
+        assert!((pool.get_weight(0, 1).unwrap() - 0.6).abs() < 0.001);
         assert!((pool.get_weight(2, 0).unwrap() - 0.0).abs() < 0.001);
     }
 

@@ -117,11 +117,45 @@ class TraceStore:
         trace = self.traces.get(trace_id)
         if trace is None:
             return
-        brain_core.trace_index_upsert_trace(
+        brain_core.trace_index_upsert_trace_full(
             self._store_id,
             trace.id,
             self._flatten_trace_neurons(trace),
+            list(trace.neurons.get("memory_short", [])),
+            list(trace.neurons.get("memory_long", [])),
+            list(trace.neurons.get("speech", [])),
+            list(trace.co_traces),
+            trace.strength,
+            trace.decay,
+            trace.novelty,
+            trace.polarity,
+            trace.fire_count,
+            trace.last_fired,
         )
+
+    def sync_runtime_state(self, trace_ids: list[str] | None = None) -> None:
+        """Refresh runtime-managed trace metadata from Rust.
+
+        Use this on colder paths that depend on live fire_count / novelty /
+        polarity / strength values without paying the cost on every tick.
+        """
+        snapshots = brain_core.trace_index_runtime_snapshots(self._store_id, trace_ids)
+        for trace_id, strength, decay, novelty, polarity, fire_count, last_fired in snapshots:
+            trace = self.traces.get(trace_id)
+            if trace is None:
+                continue
+            trace.strength = strength
+            trace.decay = decay
+            trace.novelty = novelty
+            trace.polarity = polarity
+            trace.fire_count = fire_count
+            trace.last_fired = last_fired
+
+    def reset_runtime_index(self) -> None:
+        """Rebuild Rust trace runtime from the current Python trace metadata."""
+        brain_core.trace_index_clear(self._store_id)
+        for trace_id in self.traces:
+            self.sync_trace(trace_id)
 
     def clear(self) -> None:
         self.traces.clear()
@@ -193,6 +227,7 @@ class TraceStore:
 
     def save(self, path: str) -> None:
         """Save all traces to a JSON file."""
+        self.sync_runtime_state()
         data = [t.to_dict() for t in self.traces.values()]
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         with open(path, "w") as f:
@@ -208,6 +243,7 @@ class TraceStore:
 
     def stats(self) -> dict:
         """Summary statistics."""
+        self.sync_runtime_state()
         if not self.traces:
             return {"count": 0}
         strengths = [t.strength for t in self.traces.values()]
