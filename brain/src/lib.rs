@@ -2176,6 +2176,7 @@ fn novel_tracker_update(
     novelty: f64,
     min_regions: usize,
     persistence_required: usize,
+    jaccard_threshold: Option<f32>,
 ) -> PyResult<Vec<HashMap<String, Vec<u32>>>> {
     with_novel_trackers(|registry| {
         registry.update(
@@ -2184,6 +2185,7 @@ fn novel_tracker_update(
             novelty as f32,
             min_regions,
             persistence_required,
+            jaccard_threshold.unwrap_or(0.4),
         )
     })
 }
@@ -2195,6 +2197,7 @@ fn novel_tracker_update_from_brain(
     min_regions: usize,
     persistence_required: usize,
     min_activation: f32,
+    jaccard_threshold: Option<f32>,
 ) -> PyResult<Vec<HashMap<String, Vec<u32>>>> {
     let region_neurons = with_brain_ref(|brain| collect_region_neuron_ids(brain, min_activation))?;
     with_novel_trackers(|registry| {
@@ -2204,6 +2207,7 @@ fn novel_tracker_update_from_brain(
             novelty as f32,
             min_regions,
             persistence_required,
+            jaccard_threshold.unwrap_or(0.4),
         )
     })
 }
@@ -2348,6 +2352,14 @@ fn binding_tracker_record_detailed_from_active_traces(
 #[pyfunction]
 fn binding_tracker_cleanup(tracker_id: u64, current_tick: u64, max_age: u64) -> PyResult<()> {
     with_binding_trackers(|registry| registry.cleanup(tracker_id, current_tick, max_age))
+}
+
+#[pyfunction]
+fn binding_tracker_mark_bound(
+    tracker_id: u64,
+    keys: Vec<(String, String, String, String)>,
+) -> PyResult<()> {
+    with_binding_trackers(|registry| registry.mark_bound(tracker_id, keys))
 }
 
 // === TICK CONTROL ===
@@ -2528,6 +2540,7 @@ fn evaluate_tick_compact_impl(
     trace_age_floor_ceiling: f64,
     binding_recall_min_relative_weight: f64,
     binding_recall_boost_scale: f64,
+    speech_boost_multiplier: f64,
     include_detailed_profile: bool,
 ) -> PyResult<(
     Vec<(u32, f32)>,
@@ -2590,6 +2603,7 @@ fn evaluate_tick_compact_impl(
             working_memory_decay as f32,
             working_memory_capacity,
             working_memory_overlay_cap,
+            speech_boost_multiplier as f32,
         )
     })?;
     let trace_match_ms = trace_match_started.elapsed().as_secs_f64() * 1000.0;
@@ -2769,6 +2783,7 @@ fn evaluate_tick_compact(
     trace_age_floor_ceiling: f64,
     binding_recall_min_relative_weight: f64,
     binding_recall_boost_scale: f64,
+    speech_boost_multiplier: f64,
 ) -> PyResult<(
     Vec<(u32, f32)>,
     Vec<(String, f64)>,
@@ -2796,6 +2811,7 @@ fn evaluate_tick_compact(
         trace_age_floor_ceiling,
         binding_recall_min_relative_weight,
         binding_recall_boost_scale,
+        speech_boost_multiplier,
         true,
     )
 }
@@ -2818,6 +2834,7 @@ fn evaluate_tick_compact_minimal(
     trace_age_floor_ceiling: f64,
     binding_recall_min_relative_weight: f64,
     binding_recall_boost_scale: f64,
+    speech_boost_multiplier: f64,
 ) -> PyResult<(
     Vec<u32>,           // active neuron IDs (flat)
     Vec<f32>,           // active neuron activations (flat, parallel to IDs)
@@ -2885,6 +2902,7 @@ fn evaluate_tick_compact_minimal(
             working_memory_decay as f32,
             working_memory_capacity,
             working_memory_overlay_cap,
+            speech_boost_multiplier as f32,
         )
     })?;
     let trace_match_ms = trace_match_started.elapsed().as_secs_f64() * 1000.0;
@@ -3101,6 +3119,11 @@ fn apply_synapse_updates_profiled_bounded(max_updates: usize) -> PyResult<NamedP
 #[pyfunction]
 fn rebuild_synapse_index() -> PyResult<()> {
     with_brain(|brain| brain.rebuild_synapses())
+}
+
+#[pyfunction]
+fn decay_synapse_weights(factor: f32, min_weight: f32) -> PyResult<u64> {
+    with_brain(|brain| Ok(brain.decay_synapse_weights(factor, min_weight)))?
 }
 
 #[pyfunction]
@@ -3718,6 +3741,12 @@ fn boost_speech(neurons: Vec<u32>, boost: f32) -> PyResult<u32> {
     with_brain(|brain| brain.boost_speech(&neurons, boost))
 }
 
+/// Zero all activations in the speech region.
+#[pyfunction]
+fn zero_speech_activations() -> PyResult<()> {
+    with_brain(|brain| brain.zero_speech_activations())
+}
+
 // === PHASE 8: SENSORY, VISUAL, AUDIO, MOTOR ===
 
 /// Encode sensory values into population-coded neuron activations.
@@ -3976,6 +4005,7 @@ fn brain_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(binding_tracker_record_from_active_traces, m)?)?;
     m.add_function(wrap_pyfunction!(binding_tracker_record_detailed_from_active_traces, m)?)?;
     m.add_function(wrap_pyfunction!(binding_tracker_cleanup, m)?)?;
+    m.add_function(wrap_pyfunction!(binding_tracker_mark_bound, m)?)?;
 
     m.add_function(wrap_pyfunction!(inject_activations, m)?)?;
     m.add_function(wrap_pyfunction!(set_attention_gain, m)?)?;
@@ -3995,6 +4025,7 @@ fn brain_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(apply_synapse_updates_profiled, m)?)?;
     m.add_function(wrap_pyfunction!(apply_synapse_updates_profiled_bounded, m)?)?;
     m.add_function(wrap_pyfunction!(rebuild_synapse_index, m)?)?;
+    m.add_function(wrap_pyfunction!(decay_synapse_weights, m)?)?;
     m.add_function(wrap_pyfunction!(get_neuron_count, m)?)?;
     m.add_function(wrap_pyfunction!(get_synapse_count, m)?)?;
     m.add_function(wrap_pyfunction!(get_synapse_topology_signature, m)?)?;
@@ -4064,6 +4095,7 @@ fn brain_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(get_peak_speech_neurons, m)?)?;
     m.add_function(wrap_pyfunction!(speech_lateral_inhibition, m)?)?;
     m.add_function(wrap_pyfunction!(boost_speech, m)?)?;
+    m.add_function(wrap_pyfunction!(zero_speech_activations, m)?)?;
 
     // Phase 8: Sensory, Visual, Audio, Motor
     m.add_function(wrap_pyfunction!(encode_sensory, m)?)?;

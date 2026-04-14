@@ -13,6 +13,7 @@ E.g., "red" (visual) + "ball" (pattern) → one object.
 from __future__ import annotations
 
 import itertools
+import time as _time
 
 import brain_core
 
@@ -148,6 +149,12 @@ class CoActivationTracker:
         """Remove old co-activation records."""
         brain_core.binding_tracker_cleanup(self._tracker_id, current_tick, max_age)
 
+    def mark_bound(self, keys: list[tuple[str, str, str, str]]) -> None:
+        """Mark pairs as bound so Rust skips them in future recording."""
+        if not keys:
+            return
+        brain_core.binding_tracker_mark_bound(self._tracker_id, list(keys))
+
     def clear(self) -> None:
         """Clear pending co-activation evidence without touching formed bindings."""
         brain_core.binding_tracker_clear(self._tracker_id)
@@ -226,6 +233,15 @@ class BindingFormationEngine:
         """
         self._recently_formed = []
         self._recently_formed_details = []
+        _t0 = _time.perf_counter()
+
+        # Limit active traces for O(N²) pair recording.
+        # Top traces by activation score capture the strongest co-activations.
+        _MAX_BINDING_TRACES = 20
+        if len(active_traces) > _MAX_BINDING_TRACES:
+            active_traces = sorted(active_traces, key=lambda x: x[1], reverse=True)[
+                :_MAX_BINDING_TRACES
+            ]
 
         # Record co-activations and check for formation-ready pairs
         ready_pairs_by_key: dict[tuple[str, str, str, str], dict[str, object]] = {}
@@ -246,6 +262,7 @@ class BindingFormationEngine:
                     str(pair["region_b"]),
                 )
                 ready_pairs_by_key[pair_key] = pair
+        _t_record = _time.perf_counter()
         ready_pairs = list(ready_pairs_by_key.values())
         active_scores = {trace_id: float(score) for trace_id, score in active_traces}
         prepared_candidates: list[dict[str, object]] = []
@@ -302,6 +319,7 @@ class BindingFormationEngine:
         consumed_pairs = list(stale_pairs)
 
         formed = 0
+        newly_bound_keys: list[tuple[str, str, str, str]] = []
         for item in selected_candidates:
             pair = item["pair"]
             trace_a = item["trace_a"]
@@ -334,6 +352,7 @@ class BindingFormationEngine:
             trace_b.binding_ids.append(binding_id)
 
             self._bound_pairs.add(pair_key)
+            newly_bound_keys.append(pair_key)
             self._recently_formed.append(binding_id)
             detail = {
                 "binding_id": binding_id,
@@ -347,7 +366,15 @@ class BindingFormationEngine:
             self._binding_details[binding_id] = detail
             formed += 1
 
-        self.tracker.consume(consumed_pairs)
+        # Consume ALL ready pairs (not just selected) to prevent unbounded
+        # accumulation in the tracker. Deferred pairs that keep co-activating
+        # will re-cross the formation threshold quickly.
+        self.tracker.consume(ready_pairs)
+
+        # Tell Rust tracker about newly bound pairs so it skips them
+        # in future record_detailed calls (avoids O(N²) waste).
+        if newly_bound_keys:
+            self.tracker.mark_bound(newly_bound_keys)
 
         selected_audio_cross_modal = sum(
             1 for item in selected_candidates if item["priority_bucket"] == 0
@@ -366,7 +393,18 @@ class BindingFormationEngine:
             "selected_audio_cross_modal": selected_audio_cross_modal,
         }
 
+        _t_form = _time.perf_counter()
+
         strengthened, missed, total_bindings = brain_core.process_bindings(0.01, tick)
+        _t_proc = _time.perf_counter()
+
+        # Timing profile (ms)
+        _profile = {
+            "record_ms": (_t_record - _t0) * 1000,
+            "candidates_ms": (_t_form - _t_record) * 1000,
+            "process_bindings_ms": (_t_proc - _t_form) * 1000,
+            "total_ms": (_t_proc - _t0) * 1000,
+        }
 
         return {
             "candidates": candidate_count,
@@ -381,6 +419,7 @@ class BindingFormationEngine:
             "strengthened": strengthened,
             "missed": missed,
             "total_bindings": total_bindings,
+            "_profile": _profile,
         }
 
     def periodic_prune(self) -> int:

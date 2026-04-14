@@ -390,6 +390,12 @@ impl Brain {
         self.synapse_pool.pending_update_count()
     }
 
+    /// Decay all synapse weights by a multiplicative factor.
+    /// Returns the number of weights that were clamped to the floor.
+    pub fn decay_synapse_weights(&mut self, factor: f32, floor_weight: f32) -> u64 {
+        self.synapse_pool.decay_all_weights(factor, floor_weight)
+    }
+
     /// Full rebuild of synapse CSR (expensive, do periodically).
     pub fn rebuild_synapses(&mut self) {
         // Build a closure that looks up neuron type by global ID
@@ -822,6 +828,11 @@ impl Brain {
     /// Boost speech neurons for output generation.
     pub fn boost_speech(&mut self, neurons: &[u32], boost: f32) -> u32 {
         region_speech::boost_speech_neurons(&mut self.regions, neurons, boost)
+    }
+
+    /// Zero all activations in the speech region.
+    pub fn zero_speech_activations(&mut self) {
+        region_speech::zero_speech_activations(&mut self.regions);
     }
 
     // === SENSORY OPERATIONS (Phase 8) ===

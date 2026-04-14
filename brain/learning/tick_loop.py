@@ -43,6 +43,7 @@ from brain.utils.config import (
     HEBBIAN_WINDOW,
     PRUNE_INTERVAL,
     REBUILD_INTERVAL,
+    SPEECH_BOOST_MULTIPLIER,
     SYNAPSE_UPDATE_MAX_BATCH_SYNAPSE_MULTIPLIER,
     SYNAPSE_UPDATE_RELEASE_INTERVAL,
     SYNAPSE_UPDATE_TARGET_DEFERRED_SYNAPSE_MULTIPLIER,
@@ -174,6 +175,7 @@ class TickLoop:
         self.last_binding_recall_candidates: list[tuple[int, float, float]] = []
         self.last_synapse_update_profile: dict[str, float] = {}
         self.working_memory_overlay_cap: int = 0
+        self.current_label: str | None = None
         self.rust_tick_batch_size: int = max(1, int(rust_tick_batch_size))
         self.collect_full_metrics: bool = bool(collect_full_metrics)
 
@@ -328,6 +330,7 @@ class TickLoop:
                 TRACE_AGE_FLOOR_CEILING,
                 BINDING_RECALL_MIN_RELATIVE_WEIGHT,
                 BINDING_RECALL_BOOST_SCALE,
+                SPEECH_BOOST_MULTIPLIER,
             )
             snapshot = self.history.push_compact_snapshot(
                 tick_num,
@@ -561,6 +564,7 @@ class TickLoop:
                 TRACE_AGE_FLOOR_CEILING,
                 BINDING_RECALL_MIN_RELATIVE_WEIGHT,
                 BINDING_RECALL_BOOST_SCALE,
+                SPEECH_BOOST_MULTIPLIER,
             )
             evaluation_ms = (time.perf_counter() - evaluation_started) * 1000
             binding_recall_candidates = []
@@ -803,6 +807,7 @@ class TickLoop:
                     co_trace_ids=self.working_memory.trace_ids,
                     history=self.history,
                     novelty_by_family=novelty_by_family,
+                    label=self.current_label,
                 )
 
             if allow_binding_formation:
@@ -960,6 +965,7 @@ class TickLoop:
             "binding_candidates": binding_stats.get("candidates", 0),
             "bindings_formed": binding_stats.get("formed", 0),
             "total_bindings": binding_stats.get("total_bindings", 0),
+            "binding_formation_stats": binding_stats,
             "rust_tick_ms": rust_tick_ms,
             "tick_prepare_ms": tick_prepare_ms,
             "tick_delayed_delivery_ms": tick_delayed_delivery_ms,
@@ -1364,6 +1370,12 @@ class TickLoop:
                 pruning_pass_sampled(tick, sample, self._synapse_last_fired)
             )
             self._prune_offset = end if end < TOTAL_NEURONS else 0
+
+        # Periodic global synapse weight decay to prevent runaway
+        # weight accumulation that degrades TPS over long training runs.
+        # Floor of 0.05 preserves structural connectivity from initial wiring.
+        if tick % 50 == 0 and tick > 0:
+            brain_core.decay_synapse_weights(0.80, 0.05)
 
         # Periodic binding prune + stale co-activation cleanup
         if tick % self._binding_maintenance_interval == 0:

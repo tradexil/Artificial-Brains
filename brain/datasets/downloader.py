@@ -53,7 +53,10 @@ def load_text_dataset(
     ds_lib = _ensure_datasets()
 
     if name == "ag_news":
-        ds = ds_lib.load_dataset("ag_news", split=f"{split}[:{max_samples}]")
+        ds = ds_lib.load_dataset("ag_news", split=split)
+        ds = ds.shuffle(seed=42)
+        if max_samples < len(ds):
+            ds = ds.select(range(max_samples))
         label_names = ["World", "Sports", "Business", "Sci/Tech"]
         return [
             {

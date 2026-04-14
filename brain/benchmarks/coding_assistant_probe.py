@@ -255,12 +255,19 @@ def run_coding_assistant_probe(
     if hf_dataset is not None:
         if verbose:
             print(f"Loading HuggingFace dataset '{hf_dataset}' ({n_samples} samples)...")
-        from brain.datasets.downloader import load_conversation_dataset
-        hf_data = load_conversation_dataset(hf_dataset, max_samples=n_samples)
+
+        # Try text dataset first, fall back to conversation dataset
+        from brain.datasets.downloader import load_text_dataset, load_conversation_dataset
+        _TEXT_DATASETS = {"ag_news", "imdb"}
+        if hf_dataset in _TEXT_DATASETS:
+            hf_data = load_text_dataset(hf_dataset, max_samples=n_samples)
+        else:
+            hf_data = load_conversation_dataset(hf_dataset, max_samples=n_samples)
+
         samples = [
             {
                 "index": i,
-                "topic": "hf_conversation",
+                "topic": hf_dataset,
                 "system": row.get("system", ""),
                 "user": row.get("user", ""),
                 "assistant": row.get("assistant", ""),
@@ -374,7 +381,7 @@ def run_coding_assistant_probe(
             total_chunks_processed += 1
             total_ticks += ticks_per_chunk + rest_ticks_between_chunks
 
-        if verbose and ((si + 1) % 100 == 0 or si == 0):
+        if verbose and ((si + 1) % 10 == 0 or si == 0):
             elapsed = time.perf_counter() - train_start
             tps = total_ticks / max(elapsed, 0.001)
             avg_novelty = novelty_sum / max(novelty_count, 1)

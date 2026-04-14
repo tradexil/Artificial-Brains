@@ -124,6 +124,20 @@ pub fn boost_speech_neurons(
     count
 }
 
+/// Zero all activations in the speech region.
+/// Call at the start of each new input to prevent residual leakage.
+pub fn zero_speech_activations(regions: &mut [Region]) {
+    let idx = match regions.iter().position(|r| r.id == RegionId::Speech) {
+        Some(i) => i,
+        None => return,
+    };
+    let n = regions[idx].neurons.count as usize;
+    for i in 0..n {
+        regions[idx].neurons.activations[i] = 0.0;
+        regions[idx].neurons.prev_activations[i] = 0.0;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

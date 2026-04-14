@@ -570,6 +570,41 @@ impl SynapsePool {
         Ok(())
     }
 
+    /// Multiplicatively decay all synapse weights towards a floor.
+    ///
+    /// Each weight becomes `max(weight * factor, floor_weight)`.
+    /// Factor should be in (0, 1), e.g. 0.95 for a 5% per-call decay.
+    /// Weights are clamped at `floor_weight` to preserve structural
+    /// connectivity from initial wiring.
+    pub fn decay_all_weights(&mut self, factor: f32, floor_weight: f32) -> u64 {
+        let mut clamped: u64 = 0;
+        if let Some(shared_weights) = &self.shared_weights {
+            for i in 0..self.weights.len() {
+                let old_w = shared_weights.load(i);
+                if old_w <= floor_weight {
+                    continue; // Already at or below floor — skip
+                }
+                let new_w = (old_w * factor).max(floor_weight);
+                if new_w <= floor_weight {
+                    clamped += 1;
+                }
+                shared_weights.store(i, new_w);
+                self.weights[i] = new_w;
+            }
+        } else {
+            for w in self.weights.iter_mut() {
+                if *w <= floor_weight {
+                    continue;
+                }
+                *w = (*w * factor).max(floor_weight);
+                if *w <= floor_weight {
+                    clamped += 1;
+                }
+            }
+        }
+        clamped
+    }
+
     #[inline]
     pub fn weight_at_index(&self, synapse_index: usize) -> Option<f32> {
         if synapse_index >= self.weights.len() {

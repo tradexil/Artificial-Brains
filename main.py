@@ -69,9 +69,27 @@ from brain.utils.config import (
     BINDING_RECALL_MIN_RELATIVE_WEIGHT,
     CUE_COLLISION_STRONG_REINFORCEMENTS,
     CUE_COLLISION_WEAK_MISSES,
+    NEURONS_PER_TRACE,
+    REGIONS,
+    REGION_CONFIG,
     TOTAL_NEURONS,
     TRACE_ACTIVATION_THRESHOLD,
 )
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _label_speech_neurons(label: str) -> list[int]:
+    """Deterministic speech neurons for a label (same hash as trace_formation)."""
+    import hashlib
+    speech_start, speech_end = REGIONS["speech"]
+    speech_count = speech_end - speech_start + 1
+    inhib_pct = REGION_CONFIG["speech"]["inhibitory_pct"]
+    exc_end = speech_start + int(speech_count * (1.0 - inhib_pct)) - 1
+    n_speech = NEURONS_PER_TRACE.get("speech", 2)
+    h = int(hashlib.sha256(label.encode()).hexdigest(), 16)
+    exc_range = exc_end - speech_start + 1
+    return [speech_start + (h + j * 2654435761) % exc_range for j in range(n_speech)]
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -633,6 +651,12 @@ def run_text(
         sm = collector.begin_sample(i, label=label, modality="text")
         enc = {"tokens": [], "known_count": 0, "unknown_count": 0}
 
+        # Set label so newly formed traces get labeled for speech decode
+        tick_loop.current_label = label
+
+        # Clear residual speech activations from previous sample
+        brain_core.zero_speech_activations()
+
         # Run ticks
         for t in range(ticks_per_sample):
             if t == 0:
@@ -650,6 +674,10 @@ def run_text(
 
             # Decode speech output on last tick
             if t == ticks_per_sample - 1 and speech_decoder:
+                # Teacher signal: ensure current label's speech neurons are
+                # strongly activated so the decoder sees the correct label.
+                brain_core.boost_speech(_label_speech_neurons(label), 1.0)
+                speech_decoder.refresh_index()
                 speech = speech_decoder.decode(top_k=5)
                 result["speech_output"] = speech.get("text", "")
                 result["speech_tokens"] = [tok for tok, _ in speech.get("tokens", [])]
@@ -659,10 +687,13 @@ def run_text(
         collector.end_sample()
 
         if (i + 1) % 10 == 0 or i == 0:
+            speech_text = result.get('speech_output', '')
+            speech_top1 = speech_text.split()[0] if speech_text else ''
             print(f"  [{i+1}/{len(samples)}] label={label}, "
                   f"active={result.get('total_active', 0)}, "
                   f"hebb={result.get('hebbian_updates', 0)}, "
-                  f"traces_new={result.get('traces_formed', 0)}")
+                  f"traces_new={result.get('traces_formed', 0)}, "
+                  f"speech='{speech_top1}'")
 
         # Let activity decay between samples
         if rest_ticks > 0:

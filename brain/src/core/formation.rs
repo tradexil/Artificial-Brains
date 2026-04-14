@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Default)]
 pub struct NovelPatternRegistry {
@@ -32,11 +32,12 @@ impl NovelPatternRegistry {
         novelty: f32,
         min_regions: usize,
         persistence_required: usize,
+        jaccard_threshold: f32,
     ) -> Vec<HashMap<String, Vec<u32>>> {
         self.trackers
             .entry(tracker_id)
             .or_insert_with(NovelPatternTracker::new)
-            .update(region_neurons, novelty, min_regions, persistence_required)
+            .update(region_neurons, novelty, min_regions, persistence_required, jaccard_threshold)
     }
 }
 
@@ -145,6 +146,16 @@ impl BindingTrackerRegistry {
         }
     }
 
+    pub fn mark_bound(
+        &mut self,
+        tracker_id: u64,
+        keys: Vec<(String, String, String, String)>,
+    ) {
+        if let Some(tracker) = self.trackers.get_mut(&tracker_id) {
+            tracker.mark_bound(&keys);
+        }
+    }
+
     pub fn cleanup(&mut self, tracker_id: u64, current_tick: u64, max_age: u64) {
         if let Some(tracker) = self.trackers.get_mut(&tracker_id) {
             tracker.cleanup(current_tick, max_age);
@@ -178,6 +189,7 @@ impl NovelPatternTracker {
         novelty: f32,
         min_regions: usize,
         persistence_required: usize,
+        jaccard_threshold: f32,
     ) -> Vec<HashMap<String, Vec<u32>>> {
         if novelty < 0.01 {
             return Vec::new();
@@ -196,7 +208,7 @@ impl NovelPatternTracker {
         if let Some(existing) = self
             .patterns
             .iter_mut()
-            .find(|pattern| jaccard_ratio(&pattern.fingerprint, &fingerprint) > 0.5)
+            .find(|pattern| jaccard_ratio(&pattern.fingerprint, &fingerprint) > jaccard_threshold)
         {
             existing.persistence += 1;
             existing.fingerprint = fingerprint;
@@ -225,17 +237,26 @@ impl NovelPatternTracker {
 
 struct BindingTracker {
     co_activations: HashMap<(String, String, String, String), Vec<u64>>,
+    bound_pairs: HashSet<(String, String, String, String)>,
 }
 
 impl BindingTracker {
     fn new() -> Self {
         Self {
             co_activations: HashMap::new(),
+            bound_pairs: HashSet::new(),
         }
     }
 
     fn clear(&mut self) {
         self.co_activations.clear();
+    }
+
+    fn mark_bound(&mut self, keys: &[(String, String, String, String)]) {
+        for key in keys {
+            self.co_activations.remove(key);
+            self.bound_pairs.insert(key.clone());
+        }
     }
 
     fn record_detailed(
@@ -262,6 +283,9 @@ impl BindingTracker {
                 }
 
                 let key = canonical_binding_key(tid_a, region_a, tid_b, region_b);
+                if self.bound_pairs.contains(&key) {
+                    continue;
+                }
                 let activations = self.co_activations.entry(key.clone()).or_default();
                 activations.push(tick);
                 if activations.len() > formation_count {
@@ -399,9 +423,9 @@ mod tests {
             ("audio".to_string(), vec![30_000, 30_001]),
         ]);
 
-        assert!(registry.update(1, pattern.clone(), 0.5, 2, 3).is_empty());
-        assert!(registry.update(1, pattern.clone(), 0.5, 2, 3).is_empty());
-        let ready = registry.update(1, pattern, 0.5, 2, 3);
+        assert!(registry.update(1, pattern.clone(), 0.5, 2, 3, 0.3).is_empty());
+        assert!(registry.update(1, pattern.clone(), 0.5, 2, 3, 0.3).is_empty());
+        let ready = registry.update(1, pattern, 0.5, 2, 3, 0.3);
 
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].len(), 2);

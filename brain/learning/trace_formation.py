@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import heapq
 import itertools
+import random
 import uuid
 from collections import defaultdict
 from dataclasses import dataclass
@@ -26,10 +27,13 @@ from brain.structures.brain_state import ActivationHistory, ActivationSnapshot
 from brain.structures.neuron_map import global_to_local, region_for_neuron
 from brain.structures.trace_store import Trace, TraceStore
 from brain.utils.config import (
+    NEURONS_PER_TRACE,
+    REGION_CONFIG,
     REGIONS,
     TRACE_FORMATION_BASELINE_WINDOW,
     TRACE_FORMATION_EXCLUDED_REGIONS,
     TRACE_FORMATION_EXCLUDED_REGION_PREFIX_NEURONS,
+    TRACE_FORMATION_JACCARD_THRESHOLD,
     TRACE_FORMATION_MAX_NEURONS_PER_REGION,
     TRACE_FORMATION_MAX_TOTAL_NEURONS,
     TRACE_FORMATION_MIN_REGIONS,
@@ -177,6 +181,9 @@ class NovelPatternTracker:
         """Drop any pending candidate state without destroying the tracker."""
         brain_core.novel_tracker_clear(self._tracker_id)
 
+    _UPDATE_FROM_BRAIN_MIN_ACTIVATION = 0.01
+    _LIGHTWEIGHT_MIN_ACTIVATION = 0.15
+
     def update_from_brain(self, novelty: float) -> list[dict[str, list[int]]]:
         """Track novel patterns and return any that meet formation criteria.
 
@@ -187,7 +194,23 @@ class NovelPatternTracker:
             novelty,
             TRACE_FORMATION_MIN_REGIONS,
             TRACE_FORMATION_PERSISTENCE,
-            0.01,
+            self._UPDATE_FROM_BRAIN_MIN_ACTIVATION,
+            TRACE_FORMATION_JACCARD_THRESHOLD,
+        )
+
+    def update_from_brain_lightweight(self, novelty: float) -> list[dict[str, list[int]]]:
+        """Like update_from_brain but with a higher activation threshold.
+
+        Used by the lightweight tracker path to get a smaller, more stable
+        neuron fingerprint that persists better across consecutive ticks.
+        """
+        return brain_core.novel_tracker_update_from_brain(
+            self._tracker_id,
+            novelty,
+            TRACE_FORMATION_MIN_REGIONS,
+            TRACE_FORMATION_PERSISTENCE,
+            self._LIGHTWEIGHT_MIN_ACTIVATION,
+            TRACE_FORMATION_JACCARD_THRESHOLD,
         )
 
     def update_from_snapshot(
@@ -211,6 +234,7 @@ class NovelPatternTracker:
             novelty,
             TRACE_FORMATION_MIN_REGIONS,
             TRACE_FORMATION_PERSISTENCE,
+            TRACE_FORMATION_JACCARD_THRESHOLD,
         )
 
 
@@ -232,6 +256,49 @@ class TraceFormationEngine:
         self._audio_quality_families: set[str] = set()
         self._visual_candidate_lock_enabled = True
         self.last_audio_family_selection_debug: dict[str, object] = {}
+
+    def lightweight_tracker_update(self, novelty: float) -> int:
+        """Feed the Rust-side tracker from brain activations without the full step() path.
+
+        Uses a higher activation threshold to get a smaller, more stable
+        fingerprint (strongly-active neurons persist better across ticks).
+        Returns the number of traces created.
+        """
+        if novelty < _TRACE_FORMATION_NOVELTY_THRESHOLD:
+            return 0
+        ready_patterns = self.tracker.update_from_brain_lightweight(novelty)
+        if not ready_patterns:
+            return 0
+        formed = 0
+        for neurons_by_region in ready_patterns:
+            if formed >= 1:  # cap lightweight formation per tick
+                break
+            trace_id = f"trace_{uuid.uuid4().hex[:8]}"
+            trace = Trace(
+                id=trace_id,
+                neurons=neurons_by_region,
+                strength=0.1,
+                novelty=1.0,
+                decay=1.0,
+            )
+            self.trace_store.add(trace)
+            self._recently_formed.append(trace_id)
+            formed += 1
+        if formed > 0:
+            self.tracker.clear()
+        return formed
+
+    def lightweight_tracker_update_no_formation(self, novelty: float) -> None:
+        """Feed the Rust-side tracker without forming any traces.
+
+        Keeps the tracker accumulating persistence so patterns are
+        ready when step() next runs (e.g. during rest ticks when WM dips).
+        Uses the same update_from_brain path as step() to ensure
+        fingerprint compatibility for Jaccard continuity.
+        """
+        if novelty < _TRACE_FORMATION_NOVELTY_THRESHOLD:
+            return
+        self.tracker.update_from_brain(novelty)
 
     def set_visual_candidate_lock_enabled(self, enabled: bool) -> None:
         self._visual_candidate_lock_enabled = bool(enabled)
@@ -952,8 +1019,26 @@ class TraceFormationEngine:
         if snapshot.active_neurons:
             for region_name, neurons in snapshot.active_neurons.items():
                 region_values[region_name].extend(neurons)
-        else:
+        elif snapshot.active_values:
             region_values = _group_active_values_by_region(snapshot.active_values)
+        else:
+            # Flat snapshot: active_values truncated at 500, but _flat_ids/_flat_vals
+            # always have the full data.  Use top-K by activation for efficiency —
+            # the strongest-firing neurons provide the most stable fingerprint.
+            flat_ids = getattr(snapshot, "_flat_ids", None)
+            flat_vals = getattr(snapshot, "_flat_vals", None)
+            if flat_ids and flat_vals and len(flat_ids) == len(flat_vals):
+                n = len(flat_ids)
+                if n <= 500:
+                    pairs = list(zip(flat_ids, flat_vals))
+                else:
+                    # Select top-500 by activation value (avoids full sort)
+                    top_indices = heapq.nlargest(
+                        500, range(n), key=lambda i: flat_vals[i]
+                    )
+                    top_indices.sort(key=lambda i: flat_ids[i])  # sort by neuron ID for region grouper
+                    pairs = [(flat_ids[i], flat_vals[i]) for i in top_indices]
+                region_values = _group_active_values_by_region(pairs)
 
         if not region_values:
             return ActivationSnapshot(tick=snapshot.tick)
@@ -1083,6 +1168,7 @@ class TraceFormationEngine:
         context_tags: list[str] | None = None,
         history: ActivationHistory | None = None,
         novelty_by_family: dict[str, float] | None = None,
+        label: str | None = None,
     ) -> int:
         """Check for and create new traces. Returns number created."""
         self._recently_formed = []
@@ -1153,15 +1239,9 @@ class TraceFormationEngine:
                 self.last_step_debug = debug
                 return 0
 
-            if (
-                source_primary_modality_family not in {"audio", "visual"}
-                and working_memory_count >= WORKING_MEMORY_CAPACITY
-            ):
-                debug["duplicate_suppression_modality_family"] = source_primary_modality_family
-                debug["passed_novelty_gate"] = novelty >= _TRACE_FORMATION_NOVELTY_THRESHOLD
-                debug["failure_stage"] = "working_memory_full"
-                self.last_step_debug = debug
-                return 0
+            # For non-visual/non-audio modalities, allow the tracker to
+            # keep accumulating even when working memory is full.  The per-trace
+            # cap in the formation loop below limits actual output.
 
             raw_snapshot = self.prepare_snapshot_for_formation(
                 snapshot,
@@ -1245,7 +1325,13 @@ class TraceFormationEngine:
             debug["candidate_snapshot_region_counts"] = candidate_region_counts
             if self.last_audio_family_selection_debug:
                 debug["audio_family_selection_debug"] = self.last_audio_family_selection_debug
-            if working_memory_count >= WORKING_MEMORY_CAPACITY and not reserve_applied:
+            # For visual/audio modalities, still gate on strict WM capacity.
+            # Text modalities are allowed through — the formation loop caps output.
+            if (
+                source_primary_modality_family in {"audio", "visual"}
+                and working_memory_count >= WORKING_MEMORY_CAPACITY
+                and not reserve_applied
+            ):
                 debug["failure_stage"] = "working_memory_full"
                 self.last_step_debug = debug
                 return 0
@@ -1311,11 +1397,37 @@ class TraceFormationEngine:
 
         formed = 0
         effective_working_memory_count = int(debug.get("working_memory_effective_count", working_memory_count))
+        # Allow up to 3 formation slots beyond working-memory capacity so text
+        # workloads (where seed traces fill WM quickly) can still learn.
+        formation_cap = WORKING_MEMORY_CAPACITY + 3
         for neurons_by_region in ready_patterns:
-            if effective_working_memory_count + formed >= WORKING_MEMORY_CAPACITY:
+            if effective_working_memory_count + formed >= formation_cap:
                 break
 
             trace_id = f"trace_{uuid.uuid4().hex[:8]}"
+            # Assign label-deterministic speech neurons so all traces with the
+            # same label share a consistent speech representation.  Any speech
+            # neurons inherited from the activation snapshot (boosted by prior
+            # traces in working memory) are replaced.
+            speech_start, speech_end = REGIONS["speech"]
+            speech_count = speech_end - speech_start + 1
+            inhib_pct = REGION_CONFIG["speech"]["inhibitory_pct"]
+            exc_end = speech_start + int(speech_count * (1.0 - inhib_pct)) - 1
+            n_speech = NEURONS_PER_TRACE.get("speech", 2)
+            if n_speech > 0 and label:
+                # Deterministic assignment: hash the label to pick neurons
+                import hashlib
+                h = int(hashlib.sha256(label.encode()).hexdigest(), 16)
+                exc_range = exc_end - speech_start + 1
+                assigned = []
+                for j in range(n_speech):
+                    offset = (h + j * 2654435761) % exc_range
+                    assigned.append(speech_start + offset)
+                neurons_by_region["speech"] = assigned
+            elif n_speech > 0 and "language" in neurons_by_region and "speech" not in neurons_by_region:
+                neurons_by_region["speech"] = random.sample(
+                    range(speech_start, exc_end + 1), n_speech
+                )
             trace = Trace(
                 id=trace_id,
                 neurons=neurons_by_region,
@@ -1324,11 +1436,16 @@ class TraceFormationEngine:
                 decay=1.0,
                 co_traces=list(co_trace_ids or []),
                 context_tags=list(context_tags or []),
+                label=label,
                 last_fired=tick,
                 formation_tick=tick,
             )
             self.trace_store.add(trace)
             self._recently_formed.append(trace_id)
+            # Directly boost the new trace's speech neurons so the decode
+            # pipeline sees an immediate signal for the current label.
+            if "speech" in neurons_by_region and neurons_by_region["speech"]:
+                brain_core.boost_speech(neurons_by_region["speech"], 0.5)
             formed += 1
 
         debug["formed_count"] = formed

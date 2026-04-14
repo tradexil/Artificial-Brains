@@ -591,6 +591,12 @@ class SampleMetrics:
         agg["final_phase"] = self.ticks[-1].get("phase", "unknown")
         agg["tick_count"] = n
 
+        # Speech output from last tick (if present)
+        last_speech = self.ticks[-1].get("speech_output", "")
+        if last_speech:
+            agg["speech_output"] = last_speech
+            agg["speech_tokens"] = self.ticks[-1].get("speech_tokens", [])
+
         return agg
 
     def to_dict(self) -> dict[str, Any]:
@@ -1259,4 +1265,25 @@ class MetricsCollector:
         print(f"  Novelty avg:      {gs.get('novelty_avg', 0):.4f}")
         print(f"  Final energy:     {gs.get('final_energy', 0):.3f}")
         print(f"  Final arousal:    {gs.get('final_arousal', 0):.3f}")
+
+        # Speech accuracy (if speech_output is present in sample summaries)
+        speech_correct = 0
+        speech_total = 0
+        speech_nonempty = 0
+        for sm in self.samples:
+            s = sm.summary()
+            label = sm.label or ""
+            speech_out = s.get("speech_output", "")
+            if not label:
+                continue
+            speech_total += 1
+            if speech_out:
+                speech_nonempty += 1
+                top1 = speech_out.split()[0]
+                if top1 == label:
+                    speech_correct += 1
+        if speech_total > 0 and speech_nonempty > 0:
+            print(f"  Speech output:    {speech_nonempty}/{speech_total} samples produced text")
+            print(f"  Speech accuracy:  {speech_correct}/{speech_total} = {100*speech_correct/speech_total:.1f}%")
+
         print(f"{'='*60}\n")

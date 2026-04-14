@@ -77,23 +77,18 @@ class SpeechOutput:
                 "text": "",
             }
 
-        # Vote: each active speech neuron votes for the tokens it maps to
-        token_votes: dict[str, float] = defaultdict(float)
-        token_labels: dict[str, str] = {}  # trace_id → label
+        # Vote: each active speech neuron votes for its label (aggregated)
+        label_votes: dict[str, float] = defaultdict(float)
 
         for neuron_id, activation in peaks:
-            for trace_id, label in self._neuron_to_tokens.get(neuron_id, []):
-                token_votes[trace_id] += activation
-                token_labels[trace_id] = label
+            for _trace_id, label in self._neuron_to_tokens.get(neuron_id, []):
+                label_votes[label] += activation
 
         # Sort by vote strength
-        ranked = sorted(token_votes.items(), key=lambda x: x[1], reverse=True)
-        tokens = []
-        for trace_id, vote in ranked:
-            label = token_labels.get(trace_id, "?")
-            tokens.append((label, vote))
+        ranked = sorted(label_votes.items(), key=lambda x: x[1], reverse=True)
+        tokens = [(label, vote) for label, vote in ranked]
 
-        # Assemble text from top-voted tokens
+        # Assemble text from top-voted labels
         text = " ".join(label for label, _ in tokens)
 
         return {

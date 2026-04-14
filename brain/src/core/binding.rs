@@ -8,16 +8,12 @@
 /// Lifecycle: Formation → Strengthening → Weakening → Dissolution
 ///   - Formation: 5+ co-activations within ±5 tick window
 ///   - Strengthening: weight += 0.05 × (1 - weight)
-///   - Weakening: weight *= 0.998 per missed opportunity
+///   - Weakening: weight *= 0.995 per missed opportunity
 ///   - Dissolution: weight < 0.05 AND fires < 10
 
 use crate::core::region::RegionId;
-use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-
-const RECALL_COMPLETION_PARALLEL_MIN_BINDINGS: usize = 128;
-const RECALL_COMPLETION_PARALLEL_CHUNK_SIZE: usize = 128;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct PatternKey {
@@ -122,12 +118,16 @@ impl BindingRecallPlan {
 
 }
 
-/// Manages all bindings with fast lookup by region pair.
+/// Manages all bindings with fast lookup by region pair and neuron.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct BindingStore {
     bindings: Vec<Binding>,
     next_id: u32,
     region_pair_index: HashMap<(RegionId, RegionId), Vec<usize>>,
+    /// Reverse index: neuron_id → binding indices containing that neuron.
+    /// Enables sparse evaluation: only check bindings whose neurons fired.
+    #[serde(skip)]
+    neuron_to_bindings: HashMap<u32, Vec<usize>>,
 }
 
 fn accumulate_max_weight_by_source(
@@ -143,24 +143,13 @@ fn accumulate_max_weight_by_source(
     }
 }
 
-fn merge_max_weight_maps(
-    mut acc: HashMap<PatternKey, f32>,
-    local: HashMap<PatternKey, f32>,
-) -> HashMap<PatternKey, f32> {
-    for (pattern_key, weight) in local {
-        acc.entry(pattern_key)
-            .and_modify(|max_weight| *max_weight = (*max_weight).max(weight))
-            .or_insert(weight);
-    }
-    acc
-}
-
 impl BindingStore {
     pub fn new() -> Self {
         Self {
             bindings: Vec::new(),
             next_id: 0,
             region_pair_index: HashMap::new(),
+            neuron_to_bindings: HashMap::new(),
         }
     }
 
@@ -175,6 +164,7 @@ impl BindingStore {
             bindings,
             next_id,
             region_pair_index: HashMap::new(),
+            neuron_to_bindings: HashMap::new(),
         };
         store.rebuild_index();
         store
@@ -191,6 +181,14 @@ impl BindingStore {
         self.next_id += 1;
         let idx = self.bindings.len();
         let pair = (pattern_a.region, pattern_b.region);
+
+        // Register neurons in the reverse index for sparse evaluation
+        for &neuron_id in &pattern_a.neurons {
+            self.neuron_to_bindings.entry(neuron_id).or_default().push(idx);
+        }
+        for &neuron_id in &pattern_b.neurons {
+            self.neuron_to_bindings.entry(neuron_id).or_default().push(idx);
+        }
 
         self.bindings.push(Binding {
             id,
@@ -210,11 +208,29 @@ impl BindingStore {
         id
     }
 
+    /// Get sorted, deduplicated binding indices that have at least one neuron
+    /// in the active set. This is the core sparse evaluation optimisation:
+    /// O(active_neurons × avg_bindings_per_neuron) instead of O(all_bindings).
+    fn touched_indices(&self, active_set: &HashSet<u32>) -> Vec<usize> {
+        let mut indices: Vec<usize> = Vec::new();
+        for &neuron_id in active_set {
+            if let Some(binding_indices) = self.neuron_to_bindings.get(&neuron_id) {
+                indices.extend_from_slice(binding_indices);
+            }
+        }
+        indices.sort_unstable();
+        indices.dedup();
+        indices
+    }
+
     /// Evaluate all bindings against current active neurons.
     /// Returns (binding_id, weight) for bindings where BOTH patterns are active.
+    /// Uses neuron→binding index for sparse evaluation.
     pub fn evaluate(&self, active_set: &HashSet<u32>) -> Vec<(u32, f32)> {
+        let touched = self.touched_indices(active_set);
         let mut results = Vec::new();
-        for binding in &self.bindings {
+        for idx in touched {
+            let binding = &self.bindings[idx];
             if binding.pattern_a.is_active(active_set) && binding.pattern_b.is_active(active_set) {
                 results.push((binding.id, binding.weight));
             }
@@ -230,9 +246,12 @@ impl BindingStore {
     }
 
     /// Find bindings where only ONE pattern is active (opportunity without co-activation).
+    /// Uses neuron→binding index for sparse evaluation.
     pub fn find_partial(&self, active_set: &HashSet<u32>) -> Vec<u32> {
+        let touched = self.touched_indices(active_set);
         let mut results = Vec::new();
-        for binding in &self.bindings {
+        for idx in touched {
+            let binding = &self.bindings[idx];
             let a = binding.pattern_a.is_active(active_set);
             let b = binding.pattern_b.is_active(active_set);
             if a ^ b {
@@ -296,6 +315,9 @@ impl BindingStore {
 
     /// Plan partner-side recall for partially active bindings.
     ///
+    /// Uses neuron→binding index for sparse evaluation: only bindings with
+    /// at least one active neuron are checked.
+    ///
     /// Invariant: relative weight is always computed against the current-tick
     /// strongest binding that contains the same source pattern, regardless of
     /// whether that stronger binding is partial, fully active, or otherwise not
@@ -306,88 +328,40 @@ impl BindingStore {
         min_relative_weight: f32,
     ) -> BindingRecallPlan {
         let min_relative_weight = min_relative_weight.clamp(0.0, 1.0);
-        let use_parallel = rayon::current_num_threads() > 1
-            && self.bindings.len() >= RECALL_COMPLETION_PARALLEL_MIN_BINDINGS;
-        let max_weight_by_source = if use_parallel {
-            self.bindings
-                .par_chunks(RECALL_COMPLETION_PARALLEL_CHUNK_SIZE)
-                .map(|chunk| {
-                    let mut local = HashMap::new();
-                    for binding in chunk {
-                        accumulate_max_weight_by_source(&mut local, binding);
-                    }
-                    local
-                })
-                .reduce(HashMap::new, merge_max_weight_maps)
-        } else {
-            let mut local = HashMap::new();
-            for binding in &self.bindings {
-                accumulate_max_weight_by_source(&mut local, binding);
-            }
-            local
-        };
+        let touched = self.touched_indices(active_set);
 
-        let candidates: Vec<(u32, PatternKey, RegionId, Vec<u32>, f32, f32)> = if use_parallel {
-            self.bindings
-                .par_iter()
-                .filter_map(|binding| {
-                    let a_ratio = binding.pattern_a.activation_ratio(active_set);
-                    let b_ratio = binding.pattern_b.activation_ratio(active_set);
-                    let a_active = a_ratio >= binding.pattern_a.threshold;
-                    let b_active = b_ratio >= binding.pattern_b.threshold;
+        if touched.is_empty() {
+            return BindingRecallPlan::default();
+        }
 
-                    if a_active == b_active {
-                        return None;
-                    }
-
-                    let (source_pattern, target_pattern, source_ratio) = if a_active {
-                        (&binding.pattern_a, &binding.pattern_b, a_ratio)
-                    } else {
-                        (&binding.pattern_b, &binding.pattern_a, b_ratio)
-                    };
-
-                    Some((
-                        binding.id,
-                        PatternKey::from(source_pattern),
-                        target_pattern.region,
-                        target_pattern.neurons.clone(),
-                        binding.weight,
-                        source_ratio,
-                    ))
-                })
-                .collect()
-        } else {
-            let mut local = Vec::new();
-            for binding in &self.bindings {
-                let a_ratio = binding.pattern_a.activation_ratio(active_set);
-                let b_ratio = binding.pattern_b.activation_ratio(active_set);
-                let a_active = a_ratio >= binding.pattern_a.threshold;
-                let b_active = b_ratio >= binding.pattern_b.threshold;
-
-                if a_active == b_active {
-                    continue;
-                }
-
-                let (source_pattern, target_pattern, source_ratio) = if a_active {
-                    (&binding.pattern_a, &binding.pattern_b, a_ratio)
-                } else {
-                    (&binding.pattern_b, &binding.pattern_a, b_ratio)
-                };
-
-                local.push((
-                    binding.id,
-                    PatternKey::from(source_pattern),
-                    target_pattern.region,
-                    target_pattern.neurons.clone(),
-                    binding.weight,
-                    source_ratio,
-                ));
-            }
-            local
-        };
+        // Build max_weight_by_source from touched bindings only.
+        // Safe because untouched bindings share no neurons with active set,
+        // so their patterns cannot be active and won't contribute to any
+        // source key that a recall candidate would reference.
+        let mut max_weight_by_source: HashMap<PatternKey, f32> = HashMap::new();
+        for &idx in &touched {
+            accumulate_max_weight_by_source(&mut max_weight_by_source, &self.bindings[idx]);
+        }
 
         let mut plan = BindingRecallPlan::default();
-        for (binding_id, source_key, target_region, target_neurons, weight, source_ratio) in candidates {
+        for &idx in &touched {
+            let binding = &self.bindings[idx];
+            let a_ratio = binding.pattern_a.activation_ratio(active_set);
+            let b_ratio = binding.pattern_b.activation_ratio(active_set);
+            let a_active = a_ratio >= binding.pattern_a.threshold;
+            let b_active = b_ratio >= binding.pattern_b.threshold;
+
+            if a_active == b_active {
+                continue;
+            }
+
+            let (source_pattern, target_pattern, source_ratio) = if a_active {
+                (&binding.pattern_a, &binding.pattern_b, a_ratio)
+            } else {
+                (&binding.pattern_b, &binding.pattern_a, b_ratio)
+            };
+
+            let source_key = PatternKey::from(source_pattern);
             let Some(max_weight) = max_weight_by_source.get(&source_key).copied() else {
                 continue;
             };
@@ -395,7 +369,7 @@ impl BindingStore {
                 continue;
             }
 
-            let relative_weight = (weight / max_weight).clamp(0.0, 1.0);
+            let relative_weight = (binding.weight / max_weight).clamp(0.0, 1.0);
             if relative_weight < min_relative_weight {
                 continue;
             }
@@ -404,9 +378,9 @@ impl BindingStore {
             plan.max_source_activation_ratio =
                 plan.max_source_activation_ratio.max(source_ratio);
             plan.signals.push(BindingRecallSignal {
-                binding_id,
-                target_region,
-                target_neurons,
+                binding_id: binding.id,
+                target_region: target_pattern.region,
+                target_neurons: target_pattern.neurons.clone(),
                 relative_weight,
                 source_activation_ratio: source_ratio,
             });
@@ -421,33 +395,26 @@ impl BindingStore {
         min_relative_weight: f32,
     ) -> Vec<BindingRecallTraceInput> {
         let min_relative_weight = min_relative_weight.clamp(0.0, 1.0);
-        let use_parallel = rayon::current_num_threads() > 1
-            && self.bindings.len() >= RECALL_COMPLETION_PARALLEL_MIN_BINDINGS;
-        let max_weight_by_source = if use_parallel {
-            self.bindings
-                .par_chunks(RECALL_COMPLETION_PARALLEL_CHUNK_SIZE)
-                .map(|chunk| {
-                    let mut local = HashMap::new();
-                    for binding in chunk {
-                        accumulate_max_weight_by_source(&mut local, binding);
-                    }
-                    local
-                })
-                .reduce(HashMap::new, merge_max_weight_maps)
-        } else {
-            let mut local = HashMap::new();
-            for binding in &self.bindings {
-                accumulate_max_weight_by_source(&mut local, binding);
-            }
-            local
-        };
+        let touched = self.touched_indices(active_set);
 
-        let build_input = |binding: &Binding| {
+        if touched.is_empty() {
+            return Vec::new();
+        }
+
+        // Build max_weight_by_source from touched bindings only
+        let mut max_weight_by_source: HashMap<PatternKey, f32> = HashMap::new();
+        for &idx in &touched {
+            accumulate_max_weight_by_source(&mut max_weight_by_source, &self.bindings[idx]);
+        }
+
+        let mut results = Vec::new();
+        for &idx in &touched {
+            let binding = &self.bindings[idx];
             let (Some(trace_id_a), Some(trace_id_b)) = (
                 binding.trace_id_a.as_ref(),
                 binding.trace_id_b.as_ref(),
             ) else {
-                return None;
+                continue;
             };
 
             let ratio_a = binding.pattern_a.activation_ratio(active_set);
@@ -464,43 +431,44 @@ impl BindingStore {
                     &binding.pattern_b
                 };
                 let source_key = PatternKey::from(source_pattern);
-                let max_weight = max_weight_by_source.get(&source_key).copied()?;
+                let Some(max_weight) = max_weight_by_source.get(&source_key).copied() else {
+                    continue;
+                };
                 if max_weight <= 0.0 {
-                    return None;
+                    continue;
                 }
                 let relative_weight = (binding.weight / max_weight).clamp(0.0, 1.0);
                 if relative_weight < min_relative_weight {
-                    return None;
+                    continue;
                 }
                 relative_weight
             } else {
-                return None;
+                continue;
             };
 
-            Some(BindingRecallTraceInput {
+            results.push(BindingRecallTraceInput {
                 binding_id: binding.id,
                 trace_id_a: trace_id_a.clone(),
                 trace_id_b: trace_id_b.clone(),
                 ratio_a,
                 ratio_b,
                 recall_weight,
-            })
-        };
-
-        if use_parallel {
-            self.bindings.par_iter().filter_map(build_input).collect()
-        } else {
-            self.bindings.iter().filter_map(build_input).collect()
+            });
         }
+
+        results
     }
 
     /// Evaluate and update bindings in one pass.
     /// Returns (strengthened_count, missed_count).
+    /// Uses neuron→binding index for sparse evaluation.
     pub fn process_activity(&mut self, active_set: &HashSet<u32>, tick: u64) -> (u32, u32) {
+        let touched = self.touched_indices(active_set);
         let mut strengthened = 0u32;
         let mut missed = 0u32;
 
-        for binding in &mut self.bindings {
+        for idx in touched {
+            let binding = &mut self.bindings[idx];
             let a = binding.pattern_a.is_active(active_set);
             let b = binding.pattern_b.is_active(active_set);
 
@@ -513,7 +481,7 @@ impl BindingStore {
                 strengthened += 1;
             } else if a ^ b {
                 binding.opportunities += 1;
-                binding.weight *= 0.998;
+                binding.weight *= 0.995;
                 binding.confidence = binding.fires as f32 / binding.opportunities.max(1) as f32;
                 missed += 1;
             }
@@ -537,7 +505,7 @@ impl BindingStore {
     pub fn record_miss(&mut self, binding_id: u32) {
         if let Some(b) = self.bindings.iter_mut().find(|b| b.id == binding_id) {
             b.opportunities += 1;
-            b.weight *= 0.998;
+            b.weight *= 0.995;
             b.confidence = b.fires as f32 / b.opportunities.max(1) as f32;
         }
     }
@@ -555,9 +523,16 @@ impl BindingStore {
 
     fn rebuild_index(&mut self) {
         self.region_pair_index.clear();
+        self.neuron_to_bindings.clear();
         for (idx, binding) in self.bindings.iter().enumerate() {
             let pair = (binding.pattern_a.region, binding.pattern_b.region);
             self.region_pair_index.entry(pair).or_default().push(idx);
+            for &neuron_id in &binding.pattern_a.neurons {
+                self.neuron_to_bindings.entry(neuron_id).or_default().push(idx);
+            }
+            for &neuron_id in &binding.pattern_b.neurons {
+                self.neuron_to_bindings.entry(neuron_id).or_default().push(idx);
+            }
         }
     }
 
@@ -690,15 +665,15 @@ mod tests {
         let id = store.add(pa, pb, 0.0);
 
         // Weaken by many missed opportunities
-        // 0.2 * 0.998^1000 ≈ 0.027 → below 0.05 threshold
-        for _ in 0..1000 {
+        // 0.2 * 0.995^600 ≈ 0.010 → below 0.10 threshold
+        for _ in 0..600 {
             store.record_miss(id);
         }
         let b = store.get(id).unwrap();
-        assert!(b.weight < 0.05, "Many misses should weaken: {}", b.weight);
+        assert!(b.weight < 0.10, "Many misses should weaken: {}", b.weight);
 
-        // Prune: weight < 0.05 and fires < 10
-        let pruned = store.prune(0.05, 10);
+        // Prune: weight < 0.10 and fires < 10
+        let pruned = store.prune(0.10, 10);
         assert_eq!(pruned, 1);
         assert!(store.is_empty());
     }

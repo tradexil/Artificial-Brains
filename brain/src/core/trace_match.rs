@@ -254,6 +254,7 @@ impl TraceMatcherRegistry {
         working_memory_decay: f32,
         working_memory_capacity: usize,
         working_memory_overlay_cap: usize,
+        speech_boost_multiplier: f32,
     ) -> TraceEvaluation {
         self.stores
             .entry(store_id)
@@ -274,6 +275,7 @@ impl TraceMatcherRegistry {
                 working_memory_decay,
                 working_memory_capacity,
                 working_memory_overlay_cap,
+                speech_boost_multiplier,
             )
     }
 
@@ -955,6 +957,7 @@ impl TraceMatcher {
         working_memory_decay: f32,
         working_memory_capacity: usize,
         working_memory_overlay_cap: usize,
+        speech_boost_multiplier: f32,
     ) -> TraceEvaluation {
         self.current_tick = tick;
         self.trace_freshness_retention = trace_freshness_retention.clamp(0.0, 1.0);
@@ -1002,10 +1005,11 @@ impl TraceMatcher {
             if !entry.memory_long_neurons.is_empty() {
                 memory_long_patterns.push(entry.memory_long_neurons.clone());
             }
-            if language_activation > 0.1 && !entry.speech_neurons.is_empty() {
+            if !entry.speech_neurons.is_empty() {
+                let effective_lang = language_activation.max(0.3);
                 speech_boosts.push((
                     entry.speech_neurons.clone(),
-                    0.2 * score * language_activation,
+                    speech_boost_multiplier * score * effective_lang,
                 ));
             }
             active_traces.push((entry.id.clone(), score));
@@ -1022,6 +1026,20 @@ impl TraceMatcher {
             if let Some(entry) = self.entry_for_id(trace_id) {
                 working_memory_neurons.extend(entry.memory_short_neurons.iter().copied());
             }
+        }
+
+        // Only keep the speech boost for the highest-scored trace so the
+        // decoder produces a clean winner-take-all output.
+        if speech_boosts.len() > 1 {
+            let best_idx = speech_boosts
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            let best = speech_boosts.swap_remove(best_idx);
+            speech_boosts.clear();
+            speech_boosts.push(best);
         }
 
         TraceEvaluation {
@@ -1311,6 +1329,7 @@ mod tests {
             0.1,
             7,
             0,
+            0.2,
         );
         assert_eq!(result.candidate_traces, 1);
         assert_eq!(result.active_traces, vec![("t1".to_string(), 1.0)]);
@@ -1366,6 +1385,7 @@ mod tests {
             0.1,
             7,
             0,
+            0.2,
         );
         assert_eq!(first.working_memory[0].1, 1.0);
 
@@ -1386,6 +1406,7 @@ mod tests {
             0.1,
             7,
             0,
+            0.2,
         );
         assert_eq!(second.working_memory.len(), 1);
         assert!(second.working_memory[0].1 < 1.0);
@@ -1462,6 +1483,7 @@ mod tests {
             0.1,
             7,
             0,
+            0.2,
         );
 
         assert_eq!(result.candidate_traces, 1);
@@ -1508,6 +1530,7 @@ mod tests {
             0.1,
             7,
             0,
+            0.2,
         );
 
         assert_eq!(result.candidate_traces, 1);
@@ -1552,6 +1575,7 @@ mod tests {
             0.1,
             7,
             0,
+            0.2,
         );
 
         assert_eq!(result.candidate_traces, 1);
@@ -1598,6 +1622,7 @@ mod tests {
                 0.1,
                 7,
                 0,
+                0.2,
             );
         }
 
@@ -1673,6 +1698,7 @@ mod tests {
             0.1,
             7,
             0,
+            0.2,
         );
 
         assert_eq!(result.candidate_traces, 3);
@@ -1767,6 +1793,7 @@ mod tests {
             0.1,
             7,
             2,
+            0.2,
         );
 
         assert_eq!(result.working_memory.len(), 3);
